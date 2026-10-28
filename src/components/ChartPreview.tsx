@@ -21,7 +21,8 @@ export const ChartPreview: React.FC<ChartPreviewProps> = ({ chart, audio, cover 
     const frameRef = useRef(0);
     const [playing, setPlaying] = useState(false);
     const [position, setPosition] = useState(0);
-    const [clicks, setClicks] = useState(true);
+    // off by default so the music is heard as it is; turn on to check the beat
+    const [clicks, setClicks] = useState(false);
 
     const line = chart.judgeLineList[0];
     const secondsPerUnit = unitSeconds(line);

@@ -38,24 +38,13 @@ interface Finger {
 const EFFECT_SECONDS = 0.35;
 const EFFECT_COLORS: Record<number, string> = { [Judgment.Perfect]: '#ffe17a', [Judgment.Good]: '#7dd3fc' };
 
-/** A short percussive click, played on every successful hit. */
-const createHitSound = (context: AudioContext) => {
-    const length = Math.round(context.sampleRate * 0.04);
-    const buffer = context.createBuffer(1, length, context.sampleRate);
-    const data = buffer.getChannelData(0);
-    for (let i = 0; i < length; i++) {
-        const t = i / context.sampleRate;
-        data[i] = (Math.sin(2 * Math.PI * 2200 * t) * 0.6 + (Math.random() * 2 - 1) * 0.4) * Math.exp(-t * 90);
-    }
-    return buffer;
-};
-
 /** Full-screen touch play of a generated chart. */
 export const PlayMode: React.FC<PlayModeProps> = ({ chart, audio, title, difficulty, level, cover, latencyMs, onExit }) => {
     const canvasRef = useRef<HTMLCanvasElement>(null);
     const coverRef = useRef<HTMLImageElement | null>(null);
     const sessionRef = useRef<PlaySession | null>(null);
-    const audioRef = useRef<{ context: AudioContext; startAt: number; hitSound: AudioBuffer } | null>(null);
+    // no hit sounds: hits should feel part of the music, not play over it
+    const audioRef = useRef<{ context: AudioContext; startAt: number } | null>(null);
     const fingersRef = useRef(new Map<number, Finger>());
     const effectsRef = useRef<Effect[]>([]);
     const frameRef = useRef(0);
@@ -112,12 +101,10 @@ export const PlayMode: React.FC<PlayModeProps> = ({ chart, audio, title, difficu
         if (hits.length === 0) return;
         const session = sessionRef.current;
         const canvas = canvasRef.current;
-        const playback = audioRef.current;
         if (!session || !canvas) return;
         const pose = linePoseAt(line, time, canvas.width, canvas.height);
         const { unit } = noteMetrics(canvas.width, canvas.height);
         const radians = (pose.angle * Math.PI) / 180;
-        let sound = false;
         for (const hit of hits) {
             if (hit.judgment === Judgment.Miss) continue;
             const x = session.notes[hit.index].x * unit;
@@ -128,15 +115,6 @@ export const PlayMode: React.FC<PlayModeProps> = ({ chart, audio, title, difficu
                 born: performance.now() / 1000,
                 color: EFFECT_COLORS[hit.judgment],
             });
-            sound = true;
-        }
-        if (sound && playback) {
-            const source = playback.context.createBufferSource();
-            source.buffer = playback.hitSound;
-            const gain = playback.context.createGain();
-            gain.gain.value = 0.5;
-            source.connect(gain).connect(playback.context.destination);
-            source.start();
         }
         setCombo(session.combo);
     }, [line]);
@@ -215,7 +193,7 @@ export const PlayMode: React.FC<PlayModeProps> = ({ chart, audio, title, difficu
         source.buffer = audio;
         source.connect(context.destination);
         source.start(startAt);
-        audioRef.current = { context, startAt, hitSound: createHitSound(context) };
+        audioRef.current = { context, startAt };
         sessionRef.current = new PlaySession(chart);
         fingersRef.current.clear();
         effectsRef.current = [];
