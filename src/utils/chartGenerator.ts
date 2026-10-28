@@ -353,6 +353,9 @@ const MOTION_STEP = 4;
 const SAFE_WIDTH = 0.45 * 1350;
 const SAFE_HEIGHT = 0.45 * 900;
 const UNIT = 1350 / 18;
+// notes are 1.8 units wide; anything closer than this in space and CLOSE_SECONDS in time would stack
+const NOTE_GAP = 2;
+const CLOSE_SECONDS = 0.3;
 const SILENCE = 0.04;
 const MIN_ONSET = 0.12;
 const SEMITONE = 1 / 12;
@@ -569,45 +572,6 @@ export const generateChart = (analysis: AudioAnalysis, options: GeneratorOptions
         notes[i].chord = true;
     }
 
-    // position follows pitch: low notes on the left, high notes on the right
-    const pitches = notes.map(n => n.pitch).sort((a, b) => a - b);
-    let low = pitches[Math.floor(0.05 * (pitches.length - 1))] ?? 0;
-    let high = pitches[Math.floor(0.95 * (pitches.length - 1))] ?? 1;
-    if (high - low < 0.5) {
-        const middle = (high + low) / 2;
-        low = middle - 0.25;
-        high = middle + 0.25;
-    }
-    let lastX = 0;
-    let lastTime = -Infinity;
-    let hold: { end: number; x: number } | null = null;
-    for (const note of notes) {
-        const normalized = Math.min(1, Math.max(0, (note.pitch - low) / (high - low)));
-        let x = (normalized * 2 - 1) * profile.spread;
-        const time = slotTime(note.slot);
-        if (note.type === 2 && time - lastTime < 0.3) {
-            // drag streams glide towards the melody instead of jumping
-            x = lastX + Math.max(-1.2, Math.min(1.2, x - lastX));
-        } else if (time - lastTime < 0.3 && Math.abs(x - lastX) < 1.5) {
-            // quick separate hits must not stack on each other
-            const away = x === lastX ? (random() < 0.5 ? -1 : 1) : Math.sign(x - lastX);
-            x = lastX + away * 1.5;
-            if (Math.abs(x) > profile.spread) x = lastX - away * 1.5;
-        }
-        if (note.chord && Math.abs(x) < 1.5) x = x < 0 ? -1.5 : 1.5;
-        // during a hold the other hand plays, on the other side of the screen
-        if (hold && note.slot < hold.end) {
-            const side = hold.x === 0 ? 1 : -Math.sign(hold.x);
-            if (Math.sign(x) !== side || Math.abs(x) < 2) x = side * Math.max(2, Math.abs(x));
-            note.chord = false;
-        }
-        note.x = Math.round(Math.max(-profile.spread, Math.min(profile.spread, x)) * 100) / 100;
-        lastX = note.x;
-        lastTime = time;
-        if (note.type === 3) hold = { end: note.slot + note.holdSlots, x: note.x };
-    }
-    const chords: PlannedNote[] = notes.filter(n => n.chord).map(n => ({ ...n, x: -n.x }));
-
     const motion = options.lineMotion === false ? undefined : buildLineMotion(analysis, {
         difficulty: options.difficulty,
         bpm: options.bpm,
@@ -616,24 +580,106 @@ export const generateChart = (analysis: AudioAnalysis, options: GeneratorOptions
         notePitches: notes.map(n => n.pitch),
         random,
     });
-    if (motion) {
-        // wherever the line is, every note must be hit on screen
-        for (const note of [...notes, ...chords]) {
-            const pose = motion.poseAt(slotTime(note.slot));
-            const radians = (pose.angle * Math.PI) / 180;
-            const cos = Math.cos(radians);
-            const sin = Math.abs(Math.sin(radians));
-            const dx = (pose.x - 0.5) * 1350;
-            const dy = Math.abs(pose.y - 0.5) * 900;
-            let low = (-SAFE_WIDTH - dx) / (UNIT * cos);
-            let high = (SAFE_WIDTH - dx) / (UNIT * cos);
-            if (sin > 1e-6) {
-                const vertical = (SAFE_HEIGHT - dy) / (UNIT * sin);
-                low = Math.max(low, -vertical);
-                high = Math.min(high, vertical);
-            }
-            note.x = Math.round(Math.min(high, Math.max(low, note.x)) * 100) / 100;
+
+    /** Where on the line a note can sit at `time` and still be hit on screen, however the line moves. */
+    const reachAt = (time: number): [number, number] => {
+        if (!motion) return [-profile.spread, profile.spread];
+        const pose = motion.poseAt(time);
+        const radians = (pose.angle * Math.PI) / 180;
+        const cos = Math.cos(radians);
+        const sin = Math.abs(Math.sin(radians));
+        const dx = (pose.x - 0.5) * 1350;
+        const dy = Math.abs(pose.y - 0.5) * 900;
+        let low = (-SAFE_WIDTH - dx) / (UNIT * cos);
+        let high = (SAFE_WIDTH - dx) / (UNIT * cos);
+        if (sin > 1e-6) {
+            const vertical = (SAFE_HEIGHT - dy) / (UNIT * sin);
+            low = Math.max(low, -vertical);
+            high = Math.min(high, vertical);
         }
+        return [Math.max(low, -profile.spread), Math.min(high, profile.spread)];
+    };
+
+    // position follows pitch (low notes on the left, high on the right), but no note may come within
+    // NOTE_GAP of a note that is still close in time, or of a hold that is still being held
+    const pitches = notes.map(n => n.pitch).sort((a, b) => a - b);
+    let low = pitches[Math.floor(0.05 * (pitches.length - 1))] ?? 0;
+    let high = pitches[Math.floor(0.95 * (pitches.length - 1))] ?? 1;
+    if (high - low < 0.5) {
+        const middle = (high + low) / 2;
+        low = middle - 0.25;
+        high = middle + 0.25;
+    }
+    const placed: { time: number; end: number; x: number; type: OfficialNote['type'] }[] = [];
+    const chords: PlannedNote[] = [];
+    let previous: { time: number; x: number; type: OfficialNote['type'] } | null = null;
+    let hold: { end: number; x: number } | null = null;
+
+    for (const note of notes) {
+        const time = slotTime(note.slot);
+        const [minX, maxX] = reachAt(time);
+        const normalized = Math.min(1, Math.max(0, (note.pitch - low) / (high - low)));
+        let x = (normalized * 2 - 1) * profile.spread;
+
+        // drag streams glide from drag to drag instead of jumping
+        const gliding = note.type === 2 && previous?.type === 2 && time - previous.time < CLOSE_SECONDS;
+        if (gliding) x = previous!.x + Math.max(-1.2, Math.min(1.2, x - previous!.x));
+
+        // during a hold the other hand plays, on the other side of the screen
+        const holding = hold && note.slot < hold.end ? hold : null;
+        const side = holding ? (holding.x === 0 ? 1 : -Math.sign(holding.x)) : 0;
+        if (holding) note.chord = false;
+
+        const neighbours = placed.filter(p => time - p.time < CLOSE_SECONDS || p.end > time);
+        // the drag right before a gliding drag is meant to be close
+        const blocking = neighbours.filter(p => !(gliding && p.time === previous!.time && p.type === 2));
+        const fits = (candidate: number) => candidate >= minX && candidate <= maxX
+            && (!side || (Math.sign(candidate) === side && Math.abs(candidate) >= NOTE_GAP))
+            && blocking.every(p => Math.abs(p.x - candidate) >= NOTE_GAP);
+        x = Math.min(maxX, Math.max(minX, x));
+        if (!fits(x)) {
+            // nearest free spot, alternating sides
+            let found: number | null = null;
+            for (let step = 1; step <= 80 && found === null; step++) {
+                for (const candidate of [x + step * 0.25, x - step * 0.25]) {
+                    if (fits(candidate)) {
+                        found = candidate;
+                        break;
+                    }
+                }
+            }
+            // a crowded moment: keep the pitch position rather than drop the note
+            if (found !== null) x = found;
+        }
+        note.x = Math.round(x * 100) / 100;
+
+        if (note.chord) {
+            // the partner mirrors the note and must be clear of everything around it too
+            const [partnerMin, partnerMax] = [minX, maxX];
+            const clear = (candidate: number) => candidate >= partnerMin && candidate <= partnerMax
+                && Math.abs(candidate - note.x) >= 2 * NOTE_GAP
+                && blocking.every(p => Math.abs(p.x - candidate) >= NOTE_GAP);
+            let partner: number | null = clear(-note.x) ? -note.x : null;
+            for (let step = 1; step <= 40 && partner === null; step++) {
+                for (const candidate of [-note.x + step * 0.25, -note.x - step * 0.25]) {
+                    if (clear(candidate)) {
+                        partner = candidate;
+                        break;
+                    }
+                }
+            }
+            if (partner === null) {
+                note.chord = false;
+            } else {
+                chords.push({ ...note, x: Math.round(partner * 100) / 100 });
+                placed.push({ time, end: time, x: partner, type: note.type });
+            }
+        }
+
+        const end = note.type === 3 ? slotTime(note.slot + note.holdSlots) : time;
+        placed.push({ time, end, x: note.x, type: note.type });
+        previous = { time, x: note.x, type: note.type };
+        if (note.type === 3) hold = { end: note.slot + note.holdSlots, x: note.x };
     }
 
     // to official format. time unit is 1/32 beat; floorPosition is distance travelled at the line speed
