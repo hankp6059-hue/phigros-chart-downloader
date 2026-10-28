@@ -11,6 +11,7 @@ import FileSaver from 'file-saver';
 import { SettingsPopup, SettingsCategory } from './components/SettingsPopup';
 import { FAQPopup } from './components/FAQPopup';
 import { AboutPopup } from './components/AboutPopup';
+import { CustomSongPopup } from './components/CustomSongPopup';
 import { InstructionPopup } from './components/InstructionPopup';
 import { ResourceErrorPopup } from './components/ResourceErrorPopup';
 import { Button } from './components/ui/Dialog';
@@ -65,6 +66,7 @@ const App: React.FC = () => {
     const [isSettingsOpen, setIsSettingsOpen] = useState(false);
     const [isFaqOpen, setIsFaqOpen] = useState(false);
     const [isAboutOpen, setIsAboutOpen] = useState(false);
+    const [isCustomSongOpen, setIsCustomSongOpen] = useState(false);
     const [settingsCategory, setSettingsCategory] = useState<SettingsCategory>('export');
     const openSettings = (category: SettingsCategory) => {
         setSettingsCategory(category);
@@ -563,6 +565,13 @@ const App: React.FC = () => {
             {isSettingsOpen && <SettingsPopup isOpen={isSettingsOpen} onClose={() => setIsSettingsOpen(false)} initialCategory={settingsCategory} />}
             {isFaqOpen && <FAQPopup isOpen={isFaqOpen} onClose={() => setIsFaqOpen(false)} />}
             {isAboutOpen && <AboutPopup isOpen={isAboutOpen} onClose={() => setIsAboutOpen(false)} />}
+            {isCustomSongOpen && (
+                <CustomSongPopup
+                    isOpen={isCustomSongOpen}
+                    onClose={() => setIsCustomSongOpen(false)}
+                    onExported={fileName => showToast(`已导出 ${fileName}`)}
+                />
+            )}
             <ResourceErrorPopup onSwitchProxy={() => openSettings('proxy')} />
             <InstructionPopup
                 isOpen={showInstruction}
@@ -603,6 +612,7 @@ const App: React.FC = () => {
                     versionError={errorVersion}
                     onRetryVersion={loadVersion}
                     onAboutClick={() => setIsAboutOpen(true)}
+                    onCustomSongClick={() => setIsCustomSongOpen(true)}
                     onFaqClick={() => setIsFaqOpen(true)}
                     onSettingsClick={() => openSettings('export')}
                     bgImage={bgImage}
@@ -630,6 +640,7 @@ const App: React.FC = () => {
                     onSettingsClick={() => openSettings('export')}
                     onFaqClick={() => setIsFaqOpen(true)}
                     onAboutClick={() => setIsAboutOpen(true)}
+                    onCustomSongClick={() => setIsCustomSongOpen(true)}
                 />
 
                 <main className="flex-1 min-h-0 grid grid-rows-[minmax(0,40%)_minmax(0,1fr)] md:grid-rows-1 md:grid-cols-[340px_minmax(0,1fr)]">

@@ -8,6 +8,7 @@ interface HeaderProps {
     onSettingsClick: () => void;
     onFaqClick: () => void;
     onAboutClick: () => void;
+    onCustomSongClick: () => void;
 }
 
 const AssetsPill: React.FC<Pick<HeaderProps, 'version' | 'isLoadingVersion' | 'versionError' | 'onRetryVersion'>> = ({ version, isLoadingVersion, versionError, onRetryVersion }) => {
@@ -34,7 +35,7 @@ const AssetsPill: React.FC<Pick<HeaderProps, 'version' | 'isLoadingVersion' | 'v
     return <span className={className} title="The game version assets are decompiled from">{content}</span>;
 };
 
-export const Header: React.FC<HeaderProps> = memo(({ onSettingsClick, onFaqClick, onAboutClick, ...versionProps }) => {
+export const Header: React.FC<HeaderProps> = memo(({ onSettingsClick, onFaqClick, onAboutClick, onCustomSongClick, ...versionProps }) => {
     const navButton = 'px-3 py-1.5 text-[13px] text-slate-400 rounded-md hover:text-white hover:bg-white/[.05] transition-colors';
     return (
         <header className="h-14 flex-none flex items-center justify-between gap-4 px-4 sm:px-6 border-b border-white/[.1] bg-[#05070a]">
@@ -47,6 +48,7 @@ export const Header: React.FC<HeaderProps> = memo(({ onSettingsClick, onFaqClick
             <nav className="flex items-center gap-1.5 flex-none">
                 <span className="hidden md:flex"><AssetsPill {...versionProps} /></span>
                 <span className="hidden md:block w-px h-5 bg-white/[.08] mx-2.5" aria-hidden="true" />
+                <button type="button" onClick={onCustomSongClick} className={`${navButton} text-[#22d3ee] hover:text-[#67e8f9]`}>自定义歌曲</button>
                 <button type="button" onClick={onAboutClick} className={navButton}>About</button>
                 <button type="button" onClick={onFaqClick} className={navButton}>FAQ</button>
                 <button

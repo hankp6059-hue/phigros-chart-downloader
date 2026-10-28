@@ -5,6 +5,7 @@ import { Settings } from '../defaultSettings';
 import { sendAllAssetsDownloadNotification, sendChartDownloadNotification } from './api';
 import { ProxySource } from './resourceUrls';
 import { getGithubToken } from './githubAuth';
+import type { CustomSongExport } from '../worker/export.worker';
 
 // Worker interface (matching the worker definition)
 interface WorkerResponse {
@@ -23,7 +24,8 @@ interface WorkerResponse {
 type ExportMessage =
     | { type: 'exportAllAssets'; files: FileInfo[]; selectedSong: Song; githubToken?: string }
     | { type: 'exportChart'; files: FileInfo[]; selectedSong: Song; selectedDifficulty: string; settings: Settings; githubToken?: string }
-    | { type: 'exportBulkAssets'; songs: Song[]; delaySeconds: number; proxySource: ProxySource; githubToken?: string };
+    | { type: 'exportBulkAssets'; songs: Song[]; delaySeconds: number; proxySource: ProxySource; githubToken?: string }
+    | { type: 'exportCustomChart'; song: CustomSongExport; settings: Settings; githubToken?: string };
 
 const runWorker = (
     message: ExportMessage, 
@@ -150,4 +152,15 @@ export const exportBulkAssets = async (
         console.error("Bulk export failed:", error);
         throw error;
     }
+};
+
+// Custom songs are the user's own files, so no download notification is sent.
+export const exportCustomChart = async (
+    song: CustomSongExport,
+    settings: Settings,
+    onProgress: (progress: number) => void
+): Promise<string> => {
+    const { blob, fileName } = await runWorker({ type: 'exportCustomChart', song, settings }, onProgress);
+    FileSaver.saveAs(blob, fileName);
+    return fileName;
 };

@@ -6,7 +6,7 @@
 
 // official format.
 
-interface OfficialNote {
+export interface OfficialNote {
     type: 1 | 2 | 3 | 4; // tap, drag, hold, flick
     time: number;
     holdTime: number;
@@ -33,7 +33,7 @@ interface OfficialSpeedEvent {
     value: number;
 }
 
-interface OfficialLine {
+export interface OfficialLine {
     bpm: number;
     judgeLineMoveEvents: OfficialMoveEvent[];
     judgeLineRotateEvents: OfficialNumericEvent[];

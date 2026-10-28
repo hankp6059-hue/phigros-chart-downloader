@@ -29,6 +29,7 @@ interface MobileLayoutProps {
     versionError: string | null;
     onRetryVersion: () => void;
     onAboutClick: () => void;
+    onCustomSongClick: () => void;
     onFaqClick: () => void;
     onSettingsClick: () => void;
 
@@ -65,6 +66,7 @@ export const MobileLayout: React.FC<MobileLayoutProps> = ({
     versionError,
     onRetryVersion,
     onAboutClick,
+    onCustomSongClick,
     onFaqClick,
     onSettingsClick,
     audio,
@@ -132,6 +134,7 @@ export const MobileLayout: React.FC<MobileLayoutProps> = ({
     const proxyLabel = PROXY_SOURCES.find(p => p.id === settings.proxySource)?.label ?? '';
 
     const menuItems: { label: string; meta: string; onClick: () => void }[] = [
+        { label: '自定义歌曲', meta: '', onClick: () => openDialog(onCustomSongClick) },
         { label: 'About', meta: '', onClick: () => openDialog(onAboutClick) },
         { label: 'FAQ', meta: String(faqData.length), onClick: () => openDialog(onFaqClick) },
         { label: 'Settings', meta: proxyLabel, onClick: () => openDialog(onSettingsClick) },

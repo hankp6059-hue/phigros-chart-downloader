@@ -10,7 +10,21 @@ import { resourceFetch, setGithubToken } from '../utils/githubAuth';
 export type ExportMessage =
     | { type: 'exportAllAssets'; files: FileInfo[]; selectedSong: Song; githubToken?: string }
     | { type: 'exportChart'; files: FileInfo[]; selectedSong: Song; selectedDifficulty: string; settings: Settings; githubToken?: string }
-    | { type: 'exportBulkAssets'; songs: Song[]; delaySeconds: number; proxySource: ProxySource; githubToken?: string };
+    | { type: 'exportBulkAssets'; songs: Song[]; delaySeconds: number; proxySource: ProxySource; githubToken?: string }
+    | { type: 'exportCustomChart'; song: CustomSongExport; settings: Settings; githubToken?: string };
+
+export interface CustomSongExport {
+    name: string;
+    composer: string;
+    charter: string;
+    difficulty: string;
+    level: number;
+    chart: OfficialChart;
+    audio: Blob;
+    audioExtension: string;
+    illustration: Blob;
+    illustrationExtension: string;
+}
 
 export type WorkerResponse =
     | { type: 'progress'; progress: number }
@@ -31,6 +45,8 @@ ctx.onmessage = async (event: MessageEvent<ExportMessage>) => {
             await handleExportChart(event.data.files, event.data.selectedSong, event.data.selectedDifficulty, event.data.settings);
         } else if (type === 'exportBulkAssets') {
             await handleExportBulkAssets(event.data.songs, event.data.delaySeconds, event.data.proxySource);
+        } else if (type === 'exportCustomChart') {
+            await handleExportCustomChart(event.data.song, event.data.settings);
         }
     } catch (error) {
         ctx.postMessage({ type: 'error', error: error instanceof Error ? error.message : String(error) });
@@ -110,7 +126,6 @@ const handleExportChart = async (
         throw new Error('Could not find all required files (chart, illustration, audio) for export.');
     }
 
-    const chartId = Math.floor(1000000000000000 + Math.random() * 9000000000000000).toString();
     const charter = selectedSong.charters[selectedDifficulty as keyof typeof selectedSong.charters] || 'Pigeon Games';
 
     // Difficulty Processing
@@ -123,17 +138,76 @@ const handleExportChart = async (
         difficultyValStr = '0';
     }
 
+    const [chartBlob, illustrationBlob, audioBlob] = await Promise.all([
+        resourceFetch(chartFile.url).then(res => res.blob()),
+        resourceFetch(illustrationFile.url).then(res => res.blob()),
+        resourceFetch(audioFile.url).then(res => res.blob()),
+    ]);
+
+    await exportPackage({
+        name: selectedSong.name,
+        composer: selectedSong.composer,
+        charter,
+        illustrator: 'Phigros',
+        difficulty: selectedDifficulty,
+        level: difficultyValStr,
+        chart: chartBlob,
+        audio: audioBlob,
+        audioExtension: 'ogg',
+        illustration: illustrationBlob,
+        illustrationExtension: 'png',
+    }, settings);
+};
+
+const handleExportCustomChart = async (song: CustomSongExport, settings: Settings) => {
+    await exportPackage({
+        name: song.name,
+        composer: song.composer,
+        charter: song.charter,
+        illustrator: 'Unknown',
+        difficulty: song.difficulty,
+        level: String(song.level),
+        chart: JSON.stringify(song.chart),
+        audio: song.audio,
+        audioExtension: song.audioExtension,
+        illustration: song.illustration,
+        illustrationExtension: song.illustrationExtension,
+    }, settings);
+};
+
+interface PackageInput {
+    name: string;
+    composer: string;
+    charter: string;
+    illustrator: string;
+    difficulty: string;
+    level: string;
+    /** official-format chart */
+    chart: Blob | string;
+    audio: Blob;
+    audioExtension: string;
+    illustration: Blob;
+    illustrationExtension: string;
+}
+
+/** Builds the Phira/RPE package (info.txt, info.yml, chart, illustration, music) and posts it back. */
+const exportPackage = async (input: PackageInput, settings: Settings) => {
+    const chartId = Math.floor(1000000000000000 + Math.random() * 9000000000000000).toString();
+    const { name, composer, charter, difficulty } = input;
+    const songFile = `${chartId}.${input.audioExtension}`;
+    const pictureFile = `${chartId}.${input.illustrationExtension}`;
+
     // Non-numeric levels (e.g. SP "?") export with difficulty 0 but keep the original label
-    const parsedDifficulty = parseFloat(difficultyValStr);
+    const parsedDifficulty = parseFloat(input.level);
     const difficultyVal = Number.isFinite(parsedDifficulty) ? parsedDifficulty : 0;
-    const levelLabel = Number.isFinite(parsedDifficulty) ? String(Math.floor(parsedDifficulty)) : difficultyValStr;
-    const levelString = `${selectedDifficulty} Lv.${levelLabel}`;
+    const levelLabel = Number.isFinite(parsedDifficulty) ? String(Math.floor(parsedDifficulty)) : input.level;
+    const levelString = `${difficulty} Lv.${levelLabel}`;
 
     const infoTemplate = `#
 Name: {SONG_NAME}
 Path: {CHART_ID}
-Song: {CHART_ID}.ogg
-Picture: {CHART_ID}.png
+Song: {SONG_FILE}
+Picture: {PICTURE_FILE}
 Chart: {CHART_ID}.json
 Level: {LEVEL_STRING}
 Composer: {COMPOSER}
@@ -141,28 +215,25 @@ Charter: {CHARTER}`;
 
     const infoContent = infoTemplate
         .replace(/{CHART_ID}/g, chartId)
-        .replace('{SONG_NAME}', selectedSong.name)
+        .replace('{SONG_FILE}', songFile)
+        .replace('{PICTURE_FILE}', pictureFile)
+        .replace('{SONG_NAME}', name)
         .replace('{LEVEL_STRING}', levelString)
-        .replace('{COMPOSER}', selectedSong.composer)
+        .replace('{COMPOSER}', composer)
         .replace('{CHARTER}', charter);
 
-    const [chartBlob, illustrationBlob, audioBlob] = await Promise.all([
-        resourceFetch(chartFile.url).then(res => res.blob()),
-        resourceFetch(illustrationFile.url).then(res => res.blob()),
-        resourceFetch(audioFile.url).then(res => res.blob()),
-    ]);
-
     const convertToRpe = settings.chartFormatConversion === 'rpe';
-    let chartData: Blob | string = chartBlob;
+    let chartData: Blob | string = input.chart;
     if (convertToRpe) {
-        const official: OfficialChart = JSON.parse(await chartBlob.text());
+        const chartText = typeof input.chart === 'string' ? input.chart : await input.chart.text();
+        const official: OfficialChart = JSON.parse(chartText);
         chartData = JSON.stringify(officialToRpe(official, {
-            name: selectedSong.name,
+            name,
             level: levelString,
             charter,
-            composer: selectedSong.composer,
-            song: `${chartId}.ogg`,
-            background: `${chartId}.png`,
+            composer,
+            song: songFile,
+            background: pictureFile,
             id: chartId,
         }, { easingFitting: settings.chartEasingFitting }));
     }
@@ -170,8 +241,8 @@ Charter: {CHARTER}`;
     const zip = new JSZip();
     zip.file("info.txt", infoContent);
     zip.file(`${chartId}.json`, chartData);
-    zip.file(`${chartId}.png`, illustrationBlob);
-    zip.file(`${chartId}.ogg`, audioBlob);
+    zip.file(pictureFile, input.illustration);
+    zip.file(songFile, input.audio);
 
     const now = new Date();
     const day = String(now.getDate()).padStart(2, '0');
@@ -179,16 +250,16 @@ Charter: {CHARTER}`;
     const year = now.getFullYear();
     const dateStr = `${day}/${month}/${year}`;
 
-    const ymlContent = `name: ${JSON.stringify(selectedSong.name)}
+    const ymlContent = `name: ${JSON.stringify(name)}
 difficulty: ${difficultyVal}
 level: ${JSON.stringify(levelString)}
 charter: ${JSON.stringify(charter)}
-composer: ${JSON.stringify(selectedSong.composer)}
-illustrator: "Phigros"
+composer: ${JSON.stringify(composer)}
+illustrator: ${JSON.stringify(input.illustrator)}
 chart: "${chartId}.json"
 format: ${convertToRpe ? '"rpe"' : 'null'}
-music: "${chartId}.ogg"
-illustration: "${chartId}.png"
+music: "${songFile}"
+illustration: "${pictureFile}"
 unlockVideo: null
 previewStart: 0.0
 previewEnd: 20.0
@@ -210,8 +281,8 @@ chartUpdated: null`;
     });
 
     const fileExtension = settings.useZipFormat ? 'zip' : 'pez';
-    const safeSongName = selectedSong.name.replace(/\s/g, '_').replace(/[<>:"/\\|?*]/g, '');
-    const fileName = `${safeSongName}_${selectedDifficulty}.${fileExtension}`;
+    const safeSongName = name.replace(/\s/g, '_').replace(/[<>:"/\\|?*]/g, '');
+    const fileName = `${safeSongName}_${difficulty}.${fileExtension}`;
 
     ctx.postMessage({ type: 'complete', blob: zipBlob, fileName, chartId });
 };
