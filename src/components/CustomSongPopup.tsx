@@ -5,6 +5,7 @@ import { exportCustomChart } from '../utils/export';
 import { ChartPreview } from './ChartPreview';
 import { DifficultyCard } from './DifficultyCard';
 import { PlayMode } from './PlayMode';
+import { PLAYER_SAFE_AUDIO, encodeWav } from '../utils/wav';
 import type { BarState } from '../utils/lineMotion';
 import {
     AudioAnalysis,
@@ -158,8 +159,11 @@ export const CustomSongPopup: React.FC<CustomSongPopupProps> = ({ isOpen, onClos
 
     const level = levelOverride ?? (generated ? String(generated.level) : '');
 
+    const audioExtension = audioFile ? fileExtension(audioFile, '') : '';
+    const keepsOriginalAudio = PLAYER_SAFE_AUDIO.includes(audioExtension);
+
     const handleExport = async () => {
-        if (!audioFile || !generated) return;
+        if (!audioFile || !audioBuffer || !generated) return;
         setShowPreview(false);
         setError(null);
         setExportProgress(0);
@@ -173,8 +177,9 @@ export const CustomSongPopup: React.FC<CustomSongPopupProps> = ({ isOpen, onClos
                 difficulty,
                 level: parseFloat(level) || 0,
                 chart: generated.chart,
-                audio: audioFile,
-                audioExtension: fileExtension(audioFile, 'ogg'),
+                // a player may not decode e.g. AAC; plain WAV always has sound
+                audio: keepsOriginalAudio ? audioFile : encodeWav(audioBuffer),
+                audioExtension: keepsOriginalAudio ? audioExtension : 'wav',
                 illustration,
                 illustrationExtension: coverFile ? fileExtension(coverFile, 'png') : 'png',
             }, settings, setExportProgress);
@@ -209,7 +214,8 @@ export const CustomSongPopup: React.FC<CustomSongPopupProps> = ({ isOpen, onClos
                         <span className="text-[12px] font-normal text-slate-500">
                             {isAnalyzing ? '正在分析节奏…' : analysis
                                 ? `时长 ${Math.floor(analysis.duration / 60)}:${String(Math.floor(analysis.duration % 60)).padStart(2, '0')} · 检测到 BPM ${analysis.bpm}`
-                                : '支持浏览器能解码的格式，导出时保留原文件。'}
+                                : '支持浏览器能解码的格式（OGG、MP3、WAV、M4A、FLAC 等）。'}
+                            {audioFile && !keepsOriginalAudio && ' · 导出时转为 WAV，确保在 Phira 里有声音'}
                         </span>
                     </label>
                     <label className={`${labelClass} items-start`}>
