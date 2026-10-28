@@ -3,6 +3,8 @@ import { DialogFrame, DialogHeader, DialogFooter, Button } from './ui/Dialog';
 import { useSettings } from '../contexts/SettingsContext';
 import { exportCustomChart } from '../utils/export';
 import { ChartPreview } from './ChartPreview';
+import { DifficultyCard } from './DifficultyCard';
+import { PlayMode } from './PlayMode';
 import type { BarState } from '../utils/lineMotion';
 import {
     AudioAnalysis,
@@ -20,6 +22,8 @@ interface CustomSongPopupProps {
 
 const inputClass = 'w-full min-w-0 h-[38px] max-md:h-11 px-3 rounded-lg bg-white/[.04] border border-white/[.08] text-[13px] max-md:text-base text-slate-200 placeholder:text-slate-600 focus:outline-none focus:border-[#22d3ee]/50';
 const labelClass = 'flex flex-col gap-1.5 text-[12px] font-medium text-slate-400';
+
+const LATENCY_KEY = 'phigrosDownloader_customLatencyMs';
 
 const MOOD_LABELS: Record<BarState, string> = {
     silent: '静默', calm: '平缓', groove: '律动', build: '铺垫', drop: '爆发', climax: '高潮',
@@ -78,6 +82,21 @@ export const CustomSongPopup: React.FC<CustomSongPopupProps> = ({ isOpen, onClos
     const [error, setError] = useState<string | null>(null);
     const [exportProgress, setExportProgress] = useState<number | null>(null);
     const [showPreview, setShowPreview] = useState(false);
+    const [playing, setPlaying] = useState(false);
+    const [latencyInput, setLatencyInput] = useState(() => {
+        try {
+            return localStorage.getItem(LATENCY_KEY) ?? '0';
+        } catch {
+            return '0';
+        }
+    });
+    useEffect(() => {
+        try {
+            localStorage.setItem(LATENCY_KEY, latencyInput);
+        } catch {
+            // private browsing: the setting just isn't remembered
+        }
+    }, [latencyInput]);
     const [lineMotion, setLineMotion] = useState(true);
 
     useEffect(() => {
@@ -124,16 +143,18 @@ export const CustomSongPopup: React.FC<CustomSongPopupProps> = ({ isOpen, onClos
     const bpmValid = Number.isFinite(bpm) && bpm >= 30 && bpm <= 400;
     const offsetMs = parseFloat(offsetInput) || 0;
 
-    const generated = useMemo(() => {
+    // every difficulty is generated so each card can show its own rating
+    const charts = useMemo(() => {
         if (!analysis || !bpmValid) return null;
-        return generateChart(analysis, {
-            difficulty,
+        return Object.fromEntries(GENERATOR_DIFFICULTIES.map(diff => [diff, generateChart(analysis, {
+            difficulty: diff,
             bpm,
             firstBeat: analysis.firstBeat + offsetMs / 1000,
             seed: `${name}|${audioFile?.size ?? 0}`,
             lineMotion,
-        });
-    }, [analysis, bpmValid, bpm, offsetMs, difficulty, name, audioFile, lineMotion]);
+        })])) as Record<GeneratorDifficulty, ReturnType<typeof generateChart>>;
+    }, [analysis, bpmValid, bpm, offsetMs, name, audioFile, lineMotion]);
+    const generated = charts?.[difficulty] ?? null;
 
     const level = levelOverride ?? (generated ? String(generated.level) : '');
 
@@ -211,26 +232,21 @@ export const CustomSongPopup: React.FC<CustomSongPopupProps> = ({ isOpen, onClos
                     <label className={labelClass}>谱师<input className={inputClass} value={charter} onChange={e => setCharter(e.target.value)} /></label>
                 </div>
 
-                <div className="flex flex-wrap items-end gap-3">
-                    <div className={labelClass}>
-                        难度
-                        <div className="flex p-[3px] gap-0.5 rounded-[9px] bg-white/[.04] border border-white/[.08]" role="radiogroup">
-                            {GENERATOR_DIFFICULTIES.map(diff => (
-                                <button
-                                    key={diff}
-                                    type="button"
-                                    role="radio"
-                                    aria-checked={diff === difficulty}
-                                    onClick={() => setDifficulty(diff)}
-                                    className={`px-3.5 py-[5px] max-md:py-[7px] rounded-md text-[13px] font-semibold transition-colors ${
-                                        diff === difficulty ? 'bg-[rgba(34,211,238,0.14)] text-[#22d3ee]' : 'text-slate-400 hover:text-slate-200'
-                                    }`}
-                                >
-                                    {diff}
-                                </button>
-                            ))}
-                        </div>
+                <div className={labelClass}>
+                    难度
+                    <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5" role="radiogroup" aria-label="难度">
+                        {GENERATOR_DIFFICULTIES.map(diff => (
+                            <DifficultyCard
+                                key={diff}
+                                difficulty={diff}
+                                level={diff === difficulty && levelOverride !== null ? levelOverride || '?' : charts ? charts[diff].level.toFixed(1) : '?'}
+                                selected={diff === difficulty}
+                                onClick={() => { setDifficulty(diff); setLevelOverride(null); }}
+                            />
+                        ))}
                     </div>
+                </div>
+                <div className="flex flex-wrap items-end gap-3">
                     <label className={`${labelClass} w-[110px]`}>
                         {levelOverride === null ? '定数（自动）' : '定数（手动）'}
                         <input className={inputClass} inputMode="decimal" value={level} onChange={e => setLevelOverride(e.target.value)} disabled={!generated} />
@@ -308,14 +324,37 @@ export const CustomSongPopup: React.FC<CustomSongPopupProps> = ({ isOpen, onClos
             </div>
 
             <DialogFooter>
-                <span className="font-mono text-[11px] tracking-[.06em] text-slate-500">{formatLabel}</span>
+                <label className="flex items-center gap-2 text-[12px] text-slate-400" title="耳机或音箱有延迟时，判定会感觉偏早；调大这个值">
+                    延迟校准
+                    <input
+                        className="w-[64px] h-8 px-2 rounded-md bg-white/[.04] border border-white/[.08] text-[13px] max-md:text-base text-slate-200 focus:outline-none focus:border-[#22d3ee]/50"
+                        inputMode="numeric"
+                        value={latencyInput}
+                        onChange={e => setLatencyInput(e.target.value)}
+                    />
+                    ms
+                </label>
                 <div className="flex items-center gap-2">
-                    <Button variant="ghost" onClick={onClose}>取消</Button>
-                    <Button variant="primary" size="md" onClick={handleExport} disabled={!generated || isExporting || generated.stats.total === 0}>
-                        {isExporting ? `导出中 ${Math.round(exportProgress ?? 0)}%` : '生成并导出'}
+                    <Button variant="outline" size="md" title={`导出为 ${formatLabel}`} onClick={handleExport} disabled={!generated || isExporting || generated.stats.total === 0}>
+                        {isExporting ? `导出中 ${Math.round(exportProgress ?? 0)}%` : '导出 PEZ'}
+                    </Button>
+                    <Button variant="primary" size="md" onClick={() => { setShowPreview(false); setPlaying(true); }} disabled={!generated || !audioBuffer || generated.stats.total === 0}>
+                        开始游玩
                     </Button>
                 </div>
             </DialogFooter>
+            {playing && generated && audioBuffer && (
+                <PlayMode
+                    chart={generated.chart}
+                    audio={audioBuffer}
+                    title={name.trim() || '未命名'}
+                    difficulty={difficulty}
+                    level={level}
+                    cover={coverUrl}
+                    latencyMs={parseFloat(latencyInput) || 0}
+                    onExit={() => setPlaying(false)}
+                />
+            )}
         </DialogFrame>
     );
 };
