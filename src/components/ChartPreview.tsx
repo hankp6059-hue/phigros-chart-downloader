@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import type { OfficialChart } from '../utils/chartConverter';
 import { renderChart, secondsPerUnit as unitSeconds } from '../utils/chartRenderer';
+import { unlockAudio } from '../utils/audioUnlock';
 
 const WIDTH = 960;
 const HEIGHT = 540;
@@ -67,6 +68,7 @@ export const ChartPreview: React.FC<ChartPreviewProps> = ({ chart, audio, cover 
 
     const play = () => {
         const context = new AudioContext();
+        unlockAudio(context);
         const offset = position >= audio.duration - 0.5 ? 0 : position;
         const startedAt = context.currentTime + 0.1;
         const source = context.createBufferSource();

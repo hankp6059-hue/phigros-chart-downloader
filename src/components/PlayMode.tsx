@@ -4,6 +4,7 @@ import type { OfficialChart } from '../utils/chartConverter';
 import { linePoseAt, noteMetrics, renderChart } from '../utils/chartRenderer';
 import { Hit, Judgment, PlaySession } from '../utils/playJudge';
 import { DifficultyCard } from './DifficultyCard';
+import { unlockAudio } from '../utils/audioUnlock';
 
 interface PlayModeProps {
     chart: OfficialChart;
@@ -187,6 +188,7 @@ export const PlayMode: React.FC<PlayModeProps> = ({ chart, audio, title, difficu
         cancelAnimationFrame(frameRef.current);
         stopAudio();
         const context = new AudioContext();
+        unlockAudio(context);
         const lead = Math.max(1.5, 3 - firstNote);
         const startAt = context.currentTime + lead;
         const source = context.createBufferSource();

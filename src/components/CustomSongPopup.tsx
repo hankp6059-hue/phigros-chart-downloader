@@ -5,7 +5,8 @@ import { exportCustomChart } from '../utils/export';
 import { ChartPreview } from './ChartPreview';
 import { DifficultyCard } from './DifficultyCard';
 import { PlayMode } from './PlayMode';
-import { PLAYER_SAFE_AUDIO, encodeWav } from '../utils/wav';
+import { encodeWav } from '../utils/wav';
+import { encodeOgg } from '../utils/oggEncode';
 import type { BarState } from '../utils/lineMotion';
 import {
     AudioAnalysis,
@@ -159,8 +160,9 @@ export const CustomSongPopup: React.FC<CustomSongPopupProps> = ({ isOpen, onClos
 
     const level = levelOverride ?? (generated ? String(generated.level) : '');
 
-    const audioExtension = audioFile ? fileExtension(audioFile, '') : '';
-    const keepsOriginalAudio = PLAYER_SAFE_AUDIO.includes(audioExtension);
+    // official music is Ogg Vorbis; anything else is converted so it plays like the official songs do
+    const keepsOriginalAudio = audioFile ? fileExtension(audioFile, '') === 'ogg' : false;
+    const [convertProgress, setConvertProgress] = useState<number | null>(null);
 
     const handleExport = async () => {
         if (!audioFile || !audioBuffer || !generated) return;
@@ -170,6 +172,21 @@ export const CustomSongPopup: React.FC<CustomSongPopupProps> = ({ isOpen, onClos
         try {
             const songName = name.trim() || '未命名';
             const illustration = coverFile ?? await createPlaceholderIllustration(songName, composer || 'Custom Song');
+            let audio: Blob = audioFile;
+            let audioExtension = 'ogg';
+            if (!keepsOriginalAudio) {
+                setConvertProgress(0);
+                try {
+                    audio = await encodeOgg(audioBuffer, setConvertProgress);
+                } catch (e) {
+                    // no WebAssembly or encoder failure: plain WAV still plays everywhere
+                    console.error(e);
+                    audio = encodeWav(audioBuffer);
+                    audioExtension = 'wav';
+                } finally {
+                    setConvertProgress(null);
+                }
+            }
             const fileName = await exportCustomChart({
                 name: songName,
                 composer: composer.trim() || 'Unknown',
@@ -177,9 +194,8 @@ export const CustomSongPopup: React.FC<CustomSongPopupProps> = ({ isOpen, onClos
                 difficulty,
                 level: parseFloat(level) || 0,
                 chart: generated.chart,
-                // a player may not decode e.g. AAC; plain WAV always has sound
-                audio: keepsOriginalAudio ? audioFile : encodeWav(audioBuffer),
-                audioExtension: keepsOriginalAudio ? audioExtension : 'wav',
+                audio,
+                audioExtension,
                 illustration,
                 illustrationExtension: coverFile ? fileExtension(coverFile, 'png') : 'png',
             }, settings, setExportProgress);
@@ -215,7 +231,7 @@ export const CustomSongPopup: React.FC<CustomSongPopupProps> = ({ isOpen, onClos
                             {isAnalyzing ? '正在分析节奏…' : analysis
                                 ? `时长 ${Math.floor(analysis.duration / 60)}:${String(Math.floor(analysis.duration % 60)).padStart(2, '0')} · 检测到 BPM ${analysis.bpm}`
                                 : '支持浏览器能解码的格式（OGG、MP3、WAV、M4A、FLAC 等）。'}
-                            {audioFile && !keepsOriginalAudio && ' · 导出时转为 WAV，确保在 Phira 里有声音'}
+                            {audioFile && !keepsOriginalAudio && ' · 导出时转为 OGG（和原游戏的音乐相同的格式）'}
                         </span>
                     </label>
                     <label className={`${labelClass} items-start`}>
@@ -342,7 +358,7 @@ export const CustomSongPopup: React.FC<CustomSongPopupProps> = ({ isOpen, onClos
                 </label>
                 <div className="flex items-center gap-2">
                     <Button variant="outline" size="md" title={`导出为 ${formatLabel}`} onClick={handleExport} disabled={!generated || isExporting || generated.stats.total === 0}>
-                        {isExporting ? `导出中 ${Math.round(exportProgress ?? 0)}%` : '导出 PEZ'}
+                        {convertProgress !== null ? `转换音频 ${Math.round(convertProgress * 100)}%` : isExporting ? `导出中 ${Math.round(exportProgress ?? 0)}%` : '导出 PEZ'}
                     </Button>
                     <Button variant="primary" size="md" onClick={() => { setShowPreview(false); setPlaying(true); }} disabled={!generated || !audioBuffer || generated.stats.total === 0}>
                         开始游玩
