@@ -1,11 +1,10 @@
-// judgment line animation driven by the song's emotional arc.
-// each bar is read for energy (loudness), activity (onset density) and brightness (spectral centroid),
-// classified (silent / calm / groove / build / drop / climax), and the line moves accordingly:
-// calm passages breathe, grooves sway, build-ups wind the line up like a drawn bow, drops snap it
-// level and slam it down, and climaxes move in a style blended from the song's own character
-// (bright and busy -> bounce, dark and heavy -> pendulum, melodic -> wave following the melody).
-// swings pass through level on the downbeats (as official charts do: the line is nearly level but
-// moving when notes are hit), and the beat bounce bottoms out exactly on the beat.
+// judgment line animation driven by the song's emotional arc, in the manner of official charts:
+// the main line stands still most of the time (about half of an official chart) and makes short
+// gestures of about 1.5 beats that return to rest, starting on accented beats. each bar is read for
+// energy, activity and brightness and classified (silent / calm / groove / build / drop / climax);
+// the mood sets how often the line gestures, section changes move it to a new resting pose, build-ups
+// tilt it slowly and drops snap it back level with a dip. the kind of gesture follows the song's
+// character (bright and busy -> dip, dark and heavy -> tilt, melodic -> sideways sway).
 
 import type { AudioAnalysis, GeneratorDifficulty } from './chartGenerator';
 
@@ -38,18 +37,25 @@ export interface LineMotion {
 }
 
 interface MotionProfile {
-    /** overall movement scale */
-    amplitude: number;
-    /** largest tilt, in degrees */
-    maxAngle: number;
+    /** tilt of a gesture, in degrees (official main lines: up to ~3-5 degrees) */
+    tilt: number;
+    /** sideways and vertical size of a gesture, as a share of the screen */
+    shift: number;
+    /** how often the line gestures compared with the default rates */
+    rate: number;
 }
 
 const MOTION: Record<GeneratorDifficulty, MotionProfile> = {
-    EZ: { amplitude: 0.45, maxAngle: 6 },
-    HD: { amplitude: 0.65, maxAngle: 10 },
-    IN: { amplitude: 0.9, maxAngle: 16 },
-    AT: { amplitude: 1.1, maxAngle: 22 },
+    EZ: { tilt: 2.5, shift: 0.012, rate: 0.7 },
+    HD: { tilt: 3, shift: 0.015, rate: 0.85 },
+    IN: { tilt: 4, shift: 0.018, rate: 1 },
+    AT: { tilt: 5, shift: 0.02, rate: 1.1 },
 };
+
+/** gestures per minute in each kind of section, before the difficulty's rate */
+const GESTURES_PER_MINUTE: Record<BarState, number> = { silent: 0, calm: 4, groove: 10, build: 0, drop: 18, climax: 18 };
+/** gesture length in beats (official median 1.5) */
+const GESTURE_BEATS = 1.5;
 
 export const BASE_Y = 0.3;
 const BEATS_PER_BAR = 4;
@@ -149,6 +155,17 @@ export const readBarMoods = (analysis: AudioAnalysis, bpm: number, firstBeat: nu
     }));
 };
 
+interface Gesture {
+    start: number;
+    duration: number;
+    kind: 'tilt' | 'dip' | 'sway';
+    /** signed size: degrees for a tilt, share of the screen otherwise */
+    amount: number;
+}
+
+/** Out and back: quick to its peak, then settling home, still at both ends. */
+const pulse = (p: number) => (p < 0.35 ? smoothstep(p / 0.35) : 1 - smoothstep((p - 0.35) / 0.65));
+
 export const buildLineMotion = (
     analysis: AudioAnalysis,
     options: {
@@ -162,86 +179,102 @@ export const buildLineMotion = (
         random: () => number;
     },
 ): LineMotion => {
-    const { amplitude: A, maxAngle } = MOTION[options.difficulty];
+    const motion = MOTION[options.difficulty];
     const beat = 60 / options.bpm;
     const bars = readBarMoods(analysis, options.bpm, options.firstBeat);
     const barSeconds = beat * BEATS_PER_BAR;
     const origin = bars[0].start;
     const { noteTimes, notePitches, random } = options;
+    const { envelope, bassEnvelope, frameSeconds, frameOrigin } = analysis;
 
-    // the song's character decides how its climaxes move
+    // the song's character decides which gestures it makes
     const meanOf = (values: Float32Array) => values.reduce((s, v) => s + v, 0) / Math.max(1, values.length);
-    const brightnessMean = meanOf(analysis.brightness);
     const busy = clamp(noteTimes.length / Math.max(1, analysis.duration) / 6, 0, 1);
-    const bright = clamp((brightnessMean - 10) / 2, 0, 1); // ~1 kHz dull .. ~4 kHz bright
+    const bright = clamp((meanOf(analysis.brightness) - 10) / 2, 0, 1); // ~1 kHz dull .. ~4 kHz bright
     const pitchMean = notePitches.reduce((s, v) => s + v, 0) / Math.max(1, notePitches.length);
     const pitchSpread = Math.sqrt(notePitches.reduce((s, v) => s + (v - pitchMean) ** 2, 0) / Math.max(1, notePitches.length));
     const melodic = clamp(pitchSpread / 0.8, 0, 1);
-    const scores = {
-        bounce: 0.2 + bright * 0.5 + busy * 0.5,
-        pendulum: 0.2 + (1 - bright) * 0.6 + (1 - busy) * 0.3,
-        wave: 0.2 + melodic * 0.9,
-    };
+    const scores = { bounce: 0.2 + bright * 0.5 + busy * 0.5, pendulum: 0.2 + (1 - bright) * 0.6 + (1 - busy) * 0.3, wave: 0.2 + melodic * 0.9 };
     const scoreSum = scores.bounce + scores.pendulum + scores.wave;
     const character = { bounce: scores.bounce / scoreSum, pendulum: scores.pendulum / scoreSum, wave: scores.wave / scoreSum };
-
-    // per-section direction so consecutive build-ups and sways do not all lean the same way
-    const direction = bars.map(() => (random() < 0.5 ? -1 : 1));
-    // sways cross the centre on downbeats; only which way they start is up to chance
-    const swayPhase = random() < 0.5 ? 0 : Math.PI;
-
-    const barIndex = (time: number) => clamp(Math.floor((time - origin) / barSeconds), 0, bars.length - 1);
-
-    // intensity between bar centres, and how "climactic" a moment is, eased over a beat
-    const intensityAt = (time: number) => {
-        const position = (time - origin) / barSeconds - 0.5;
-        const i = clamp(Math.floor(position), 0, bars.length - 1);
-        const j = Math.min(bars.length - 1, i + 1);
-        const w = clamp(position - i, 0, 1);
-        return bars[i].intensity * (1 - w) + bars[j].intensity * w;
+    const pickKind = (): Gesture['kind'] => {
+        const r = random();
+        return r < character.bounce ? 'dip' : r < character.bounce + character.pendulum ? 'tilt' : 'sway';
     };
-    const stateWeight = (time: number, match: (s: BarState) => boolean) => {
-        const b = barIndex(time);
-        const here = match(bars[b].state) ? 1 : 0;
-        const into = (time - bars[b].start) / beat;
-        const previous = b > 0 && match(bars[b - 1].state) ? 1 : 0;
-        // ease in over the first beat of a bar from the previous bar's value
-        return into < 1 ? previous + (here - previous) * smoothstep(into) : here;
-    };
-    const isClimax = (s: BarState) => s === 'climax' || s === 'drop';
 
-    // build-ups: progress 0..1 across the run of build bars ending at a drop
+    // how accented a beat is: the strongest onset right on it
+    const accentAt = (time: number) => {
+        const center = Math.round((time - frameOrigin) / frameSeconds);
+        let peak = 0;
+        for (let f = center - 2; f <= center + 2; f++) {
+            if (f >= 0 && f < envelope.length) peak = Math.max(peak, envelope[f], bassEnvelope[f]);
+        }
+        return peak;
+    };
+
+    // gestures: per bar, as many as its mood calls for, on its most accented beats, never overlapping
+    const gestures: Gesture[] = [];
+    let carry = 0;
+    let side = random() < 0.5 ? -1 : 1;
+    const free = (start: number, duration: number) => gestures.every(g => start >= g.start + g.duration + beat / 2 || start + duration <= g.start - beat / 2);
+    for (const bar of bars) {
+        carry = Math.min(1, carry + (GESTURES_PER_MINUTE[bar.state] * motion.rate * barSeconds) / 60);
+        if (bar.state === 'drop' && bar.start >= 0 && free(bar.start, 2 * beat)) {
+            // the drop itself: a dip right on its downbeat
+            gestures.push({ start: bar.start, duration: 2 * beat, kind: 'dip', amount: -2 * motion.shift });
+            carry = 0;
+            continue;
+        }
+        const beats = Array.from({ length: BEATS_PER_BAR }, (_, k) => bar.start + k * beat)
+            .filter(t => t >= 0)
+            .map((t, k) => ({ t, accent: accentAt(t) * (k === 0 ? 1.2 : 1) }))
+            .sort((a, b) => b.accent - a.accent);
+        for (const candidate of beats) {
+            if (carry < 1 || candidate.accent < 0.35) break;
+            if (!free(candidate.t, GESTURE_BEATS * beat)) continue;
+            const kind = pickKind();
+            side = -side;
+            const size = (0.6 + 0.4 * bar.intensity) * (kind === 'tilt' ? motion.tilt : motion.shift);
+            gestures.push({ start: candidate.t, duration: GESTURE_BEATS * beat, kind, amount: kind === 'dip' ? -size : side * size });
+            carry -= 1;
+        }
+    }
+    gestures.sort((a, b) => a.start - b.start);
+
+    // resting pose per section: a small new position whenever the mood changes, eased in over two beats
+    const rests = [{ start: -Infinity, x: 0.5, y: BASE_Y, angle: 0 }];
+    for (let b = 1; b < bars.length; b++) {
+        if (bars[b].state === bars[b - 1].state || bars[b].state === 'build') continue;
+        const settled = bars[b].state === 'calm' || bars[b].state === 'silent' || bars[b].state === 'drop';
+        rests.push({
+            start: bars[b].start,
+            x: settled ? 0.5 : 0.5 + (random() * 2 - 1) * motion.shift * 2,
+            y: BASE_Y + (settled ? 0 : (random() * 2 - 1) * motion.shift),
+            angle: settled ? 0 : (random() * 2 - 1) * motion.tilt * 0.5,
+        });
+    }
+    const restAt = (time: number) => {
+        let i = rests.length - 1;
+        while (i > 0 && rests[i].start > time) i--;
+        const to = rests[i];
+        if (i === 0) return to;
+        const from = rests[i - 1];
+        const p = smoothstep((time - to.start) / (2 * beat));
+        return { start: to.start, x: from.x + (to.x - from.x) * p, y: from.y + (to.y - from.y) * p, angle: from.angle + (to.angle - from.angle) * p };
+    };
+
+    // build-ups: a slow lean towards the drop, snapped back level just before it lands
     const buildRuns: { start: number; drop: number; direction: number }[] = [];
     for (let b = 0; b < bars.length; b++) {
         if (bars[b].state !== 'build' || (b > 0 && bars[b - 1].state === 'build')) continue;
         let e = b;
         while (e + 1 < bars.length && bars[e + 1].state === 'build') e++;
-        buildRuns.push({ start: bars[b].start, drop: bars[e].end, direction: direction[b] });
+        buildRuns.push({ start: bars[b].start, drop: bars[e].end, direction: random() < 0.5 ? -1 : 1 });
     }
-    const drops = bars.filter(b => b.state === 'drop').map(b => b.start);
-
-    // smoothed melody contour (octaves above the song's mean) for the wave style
-    const melodyAt = (time: number) => {
-        let sum = 0;
-        let weight = 0;
-        const radius = beat * 2;
-        let lo = 0;
-        let hi = noteTimes.length;
-        while (lo < hi) {
-            const mid = (lo + hi) >> 1;
-            if (noteTimes[mid] < time - radius) lo = mid + 1;
-            else hi = mid;
-        }
-        for (let i = lo; i < noteTimes.length && noteTimes[i] <= time + radius; i++) {
-            const w = 1 - Math.abs(noteTimes[i] - time) / radius;
-            sum += (notePitches[i] - pitchMean) * w;
-            weight += w;
-        }
-        return weight > 0 ? clamp(sum / weight / Math.max(pitchSpread, 0.2), -1.5, 1.5) : 0;
-    };
 
     const firstNote = noteTimes[0] ?? 0;
     const lastNote = noteTimes[noteTimes.length - 1] ?? analysis.duration;
+    const barIndex = (time: number) => clamp(Math.floor((time - origin) / barSeconds), 0, bars.length - 1);
     const nearNote = (time: number, window: number) => {
         let lo = 0;
         let hi = noteTimes.length;
@@ -254,52 +287,25 @@ export const buildLineMotion = (
     };
 
     const poseAt = (time: number): LinePose => {
-        const beatPosition = (time - options.firstBeat) / beat;
-        const barPosition = beatPosition / BEATS_PER_BAR;
-        const intensity = intensityAt(time);
-        const climax = stateWeight(time, isClimax);
-        const calm = stateWeight(time, s => s === 'calm' || s === 'silent');
+        let { x, y, angle } = restAt(time);
 
-        let x = 0.5;
-        let y = BASE_Y;
-        let angle = 0;
-
-        // breathing: slow rise and fall every two bars, strongest when the song is quiet
-        y += 0.014 * A * Math.sin(Math.PI * barPosition) * (0.4 + 0.6 * calm);
-
-        // groove: two-bar sway that grows with intensity, fading out where the climax takes over
-        const sway = Math.sin(Math.PI * barPosition + swayPhase);
-        x += 0.1 * A * intensity * sway * (1 - climax);
-        angle += 0.4 * maxAngle * intensity * sway * (1 - climax);
-
-        if (climax > 0) {
-            // bounce: lowest (and still) on every beat
-            const bounce = (1 + Math.cos(2 * Math.PI * beatPosition)) / 2;
-            y -= climax * character.bounce * 0.035 * A * bounce;
-            // pendulum: wide swing, one bar each way, sweeping through level on the downbeats
-            const pendulum = Math.sin(Math.PI * barPosition + swayPhase);
-            angle += climax * character.pendulum * maxAngle * pendulum;
-            x -= climax * character.pendulum * 0.12 * A * pendulum;
-            // wave: the line follows the melody
-            const melody = melodyAt(time);
-            x += climax * character.wave * 0.12 * A * melody;
-            angle += climax * character.wave * 0.5 * maxAngle * melody;
+        for (const g of gestures) {
+            if (g.start > time) break;
+            const p = (time - g.start) / g.duration;
+            if (p >= 1) continue;
+            const shape = pulse(p);
+            if (g.kind === 'tilt') angle += g.amount * shape;
+            else if (g.kind === 'dip') y += g.amount * shape;
+            else x += g.amount * shape;
         }
 
-        // build-up: wind the line up towards the drop, then snap it level just before it lands
         for (const run of buildRuns) {
             if (time < run.start || time > run.drop) continue;
             const progress = (time - run.start) / (run.drop - run.start);
             const snapStart = run.drop - beat / 2;
             const release = time < snapStart ? 1 : 1 - easeOut((time - snapStart) / (beat / 2));
-            angle += run.direction * 0.9 * maxAngle * progress * progress * release;
-            y += 0.06 * A * progress * release;
-            x += 0.02 * A * Math.sin(2 * Math.PI * beatPosition * (1 + progress)) * progress * release;
-        }
-
-        // drop impact: the line slams down for a beat
-        for (const drop of drops) {
-            if (time >= drop && time < drop + beat) y -= 0.04 * A * Math.sin(Math.PI * (time - drop) / beat);
+            angle += run.direction * 2 * motion.tilt * progress * progress * release;
+            y += 2 * motion.shift * progress * release;
         }
 
         // fade in before the first note, out after the last; dim during silence without notes
@@ -308,12 +314,7 @@ export const buildLineMotion = (
         alpha = Math.min(alpha, 1 - smoothstep((time - (lastNote + beat)) / (2 * beat)));
         if (bars[barIndex(time)].state === 'silent' && !nearNote(time, beat)) alpha = Math.min(alpha, 0.4);
 
-        return {
-            x: clamp(x, 0.5 - 0.15 * A, 0.5 + 0.15 * A),
-            y: clamp(y, 0.2, 0.45),
-            angle: clamp(angle, -maxAngle, maxAngle),
-            alpha,
-        };
+        return { x: clamp(x, 0.38, 0.62), y: clamp(y, 0.2, 0.45), angle: clamp(angle, -12, 12), alpha };
     };
 
     return { bars, character, poseAt };

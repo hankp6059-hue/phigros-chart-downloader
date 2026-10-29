@@ -364,9 +364,12 @@ const MOTION_STEP = 4;
 const SAFE_WIDTH = 0.45 * 1350;
 const SAFE_HEIGHT = 0.45 * 900;
 const UNIT = 1350 / 18;
-// notes are 1.8 units wide; anything closer than this in space and CLOSE_SECONDS in time would stack
+// notes are 1.8 units wide. within CLOSE_SECONDS of each other two notes are either a clean repeat
+// (exactly the same spot, at least REPEAT_SECONDS apart) or at least NOTE_GAP apart, never half on
+// top of each other
 const NOTE_GAP = 2;
-const CLOSE_SECONDS = 0.18;
+const CLOSE_SECONDS = 0.4;
+const REPEAT_SECONDS = 0.25;
 // drag streams glide note to note within this gap
 const GLIDE_SECONDS = 0.3;
 const SILENCE = 0.04;
@@ -706,6 +709,7 @@ export const generateChart = (analysis: AudioAnalysis, options: GeneratorOptions
     };
     const placed: { time: number; end: number; x: number; type: OfficialNote['type'] }[] = [];
     const chords: PlannedNote[] = [];
+    const dropped = new Set<PlannedNote>();
     let previous: { time: number; x: number; type: OfficialNote['type']; pitch: number } | null = null;
     let hold: { end: number; x: number } | null = null;
 
@@ -719,7 +723,8 @@ export const generateChart = (analysis: AudioAnalysis, options: GeneratorOptions
         if (gliding) x = previous!.x + Math.max(-1.2, Math.min(1.2, x - previous!.x));
         // quick notes often switch hands
         // the same note again sits where it was (a repeat), otherwise quick notes often switch hands
-        else if (previous && time - previous.time < 0.4 && Math.abs(note.pitch - previous.pitch) < SEMITONE / 2) x = previous.x;
+        else if (previous && time - previous.time >= REPEAT_SECONDS && time - previous.time < 0.4
+            && previous.type !== 3 && Math.abs(note.pitch - previous.pitch) < SEMITONE / 2) x = previous.x;
         else if (previous && time - previous.time < 0.4 && Math.sign(x) === Math.sign(previous.x) && random() < profile.alternate) {
             x = -Math.sign(previous.x || 1) * Math.max(1.5, Math.abs(x));
         }
@@ -732,9 +737,16 @@ export const generateChart = (analysis: AudioAnalysis, options: GeneratorOptions
         const neighbours = placed.filter(p => time - p.time < CLOSE_SECONDS || p.end > time);
         // the drag right before a gliding drag is meant to be close
         const blocking = neighbours.filter(p => !(gliding && p.time === previous!.time && p.type === 2));
+        const clearOf = (p: (typeof placed)[number], candidate: number) => {
+            const dx = Math.abs(p.x - candidate);
+            // positions are rounded to 0.01 afterwards, which must not bring them under NOTE_GAP
+            if (dx >= NOTE_GAP + 0.01) return true;
+            // a clean repeat: same spot, far enough apart in time, and not on a hold still being held
+            return dx < 0.05 && p.type !== 3 && p.end <= time && time - p.time >= REPEAT_SECONDS;
+        };
         const fits = (candidate: number) => candidate >= minX && candidate <= maxX
             && (!side || (Math.sign(candidate) === side && Math.abs(candidate) >= NOTE_GAP))
-            && blocking.every(p => Math.abs(p.x - candidate) >= NOTE_GAP);
+            && blocking.every(p => clearOf(p, candidate));
         x = Math.min(maxX, Math.max(minX, x));
         if (!fits(x)) {
             // nearest free spot, alternating sides
@@ -747,13 +759,20 @@ export const generateChart = (analysis: AudioAnalysis, options: GeneratorOptions
                     }
                 }
             }
-            // a crowded moment: keep the pitch position rather than drop the note
-            if (found !== null) x = found;
+            // no room anywhere: one note fewer is better than two on top of each other
+            if (found === null) {
+                dropped.add(note);
+                continue;
+            }
+            x = found;
         }
         if (profile.grid) {
             const snapped = Math.round(x / profile.grid) * profile.grid;
             if (fits(snapped) || !fits(x)) x = snapped;
         }
+        // a repeat lands exactly on the earlier note, not a hair beside it
+        const repeated = blocking.find(p => Math.abs(p.x - x) < 0.05);
+        if (repeated) x = repeated.x;
         note.x = Math.round(x * 100) / 100;
 
         if (note.chord) {
@@ -761,7 +780,7 @@ export const generateChart = (analysis: AudioAnalysis, options: GeneratorOptions
             const [partnerMin, partnerMax] = [minX, maxX];
             const clear = (candidate: number) => candidate >= partnerMin && candidate <= partnerMax
                 && Math.abs(candidate - note.x) >= 3.5
-                && blocking.every(p => Math.abs(p.x - candidate) >= NOTE_GAP);
+                && blocking.every(p => Math.abs(p.x - candidate) >= NOTE_GAP + 0.01);
             // official chords sit about 6 units apart
             const wanted = note.x - Math.sign(note.x || 1) * (4 + random() * 4);
             let partner: number | null = clear(wanted) ? wanted : null;
@@ -777,7 +796,7 @@ export const generateChart = (analysis: AudioAnalysis, options: GeneratorOptions
                 note.chord = false;
             } else {
                 chords.push({ ...note, x: Math.round(partner * 100) / 100 });
-                placed.push({ time, end: time, x: partner, type: note.type });
+                placed.push({ time, end: time, x: Math.round(partner * 100) / 100, type: note.type });
             }
         }
 
@@ -790,7 +809,32 @@ export const generateChart = (analysis: AudioAnalysis, options: GeneratorOptions
     // to official format. time unit is 1/32 beat; floorPosition is distance travelled at the line speed
     const toTime = (seconds: number) => Math.round((seconds * options.bpm) / 1.875);
     const toSeconds = (time: number) => (time * 1.875) / options.bpm;
-    const officialNotes: OfficialNote[] = [...notes, ...chords]
+    // final guarantee for the player: within CLOSE_SECONDS two notes are a clean repeat or NOTE_GAP
+    // apart (drag streams aside). a note off by a hair snaps onto the earlier one, anything else goes
+    const final = [...notes.filter(n => !dropped.has(n)), ...chords].sort((a, b) => a.slot - b.slot);
+    const kept: PlannedNote[] = [];
+    for (const note of final) {
+        const time = slotTime(note.slot);
+        const endOf = (n: PlannedNote) => slotTime(n.slot + (n.type === 3 ? n.holdSlots : 0));
+        // notes still close in time (or holds still held)
+        const near: PlannedNote[] = [];
+        for (let k = kept.length - 1; k >= 0; k--) {
+            const gap = time - slotTime(kept[k].slot);
+            if (gap >= CLOSE_SECONDS + 4) break;
+            if (gap < CLOSE_SECONDS || endOf(kept[k]) > time) near.push(kept[k]);
+        }
+        const canRepeat = (other: PlannedNote) => other.type !== 3 && endOf(other) <= time
+            && time - slotTime(other.slot) >= REPEAT_SECONDS - 0.001;
+        const clear = (other: PlannedNote) => {
+            const dx = Math.abs(note.x - other.x);
+            return dx >= NOTE_GAP || (note.type === 2 && other.type === 2) || (dx === 0 && canRepeat(other));
+        };
+        // off by a hair from the most recent note: make it an exact repeat
+        const hair = near.find(other => !clear(other) && Math.abs(note.x - other.x) < 0.25 && canRepeat(other));
+        if (hair) note.x = hair.x;
+        if (near.every(clear)) kept.push(note);
+    }
+    const officialNotes: OfficialNote[] = kept
         .map(note => {
             const time = toTime(slotTime(note.slot));
             const holdTime = note.type === 3 ? toTime(slotTime(note.slot + note.holdSlots)) - time : 0;
