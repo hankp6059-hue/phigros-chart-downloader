@@ -18,7 +18,7 @@ interface PlayModeProps {
     onExit: () => void;
 }
 
-type Phase = 'ready' | 'playing' | 'paused' | 'results';
+type Phase = 'ready' | 'playing' | 'paused' | 'countdown' | 'results';
 
 interface Effect {
     x: number;
@@ -37,6 +37,8 @@ interface Finger {
 }
 
 const EFFECT_SECONDS = 0.35;
+// seconds counted down after resuming, during which the chart stays still
+const RESUME_COUNTDOWN = 3;
 const EFFECT_COLORS: Record<number, string> = { [Judgment.Perfect]: '#ffe17a', [Judgment.Good]: '#7dd3fc' };
 
 /** Full-screen touch play of a generated chart. */
@@ -51,6 +53,7 @@ export const PlayMode: React.FC<PlayModeProps> = ({ chart, audio, title, difficu
     const frameRef = useRef(0);
     const [phase, setPhase] = useState<Phase>('ready');
     const [combo, setCombo] = useState(0);
+    const [countdown, setCountdown] = useState(0);
     const [portrait, setPortrait] = useState(false);
     const [summary, setSummary] = useState<{ perfect: number; good: number; miss: number; maxCombo: number; total: number } | null>(null);
 
@@ -209,17 +212,33 @@ export const PlayMode: React.FC<PlayModeProps> = ({ chart, audio, title, difficu
         if (!audioRef.current) return;
         cancelAnimationFrame(frameRef.current);
         audioRef.current.context.suspend();
-        setPhase(p => (p === 'playing' ? 'paused' : p));
+        setPhase(p => (p === 'playing' || p === 'countdown' ? 'paused' : p));
     }, []);
 
+    // the music stays suspended (so the chart stays still) through the countdown, then both carry on
+    // from exactly where they stopped
     const resume = () => {
-        audioRef.current?.context.resume();
-        setPhase('playing');
-        frameRef.current = requestAnimationFrame(frame);
+        // fingers lifted while paused never sent their release
+        for (const id of fingersRef.current.keys()) sessionRef.current?.release(id);
+        fingersRef.current.clear();
+        setCountdown(RESUME_COUNTDOWN);
+        setPhase('countdown');
     };
 
     useEffect(() => {
-        const onHidden = () => { if (document.hidden && phase === 'playing') pause(); };
+        if (phase !== 'countdown') return;
+        if (countdown <= 0) {
+            audioRef.current?.context.resume();
+            setPhase('playing');
+            frameRef.current = requestAnimationFrame(frame);
+            return;
+        }
+        const timer = window.setTimeout(() => setCountdown(c => c - 1), 1000);
+        return () => window.clearTimeout(timer);
+    }, [phase, countdown, frame]);
+
+    useEffect(() => {
+        const onHidden = () => { if (document.hidden && (phase === 'playing' || phase === 'countdown')) pause(); };
         document.addEventListener('visibilitychange', onHidden);
         return () => document.removeEventListener('visibilitychange', onHidden);
     }, [pause, phase]);
@@ -293,7 +312,7 @@ export const PlayMode: React.FC<PlayModeProps> = ({ chart, audio, title, difficu
                 onContextMenu={e => e.preventDefault()}
             />
 
-            {(phase === 'playing' || phase === 'paused') && (
+            {(phase === 'playing' || phase === 'paused' || phase === 'countdown') && (
                 <>
                     <button type="button" onClick={pause} aria-label="暂停" className="absolute top-3 left-3 w-11 h-11 rounded-full bg-white/10 text-white flex items-center justify-center">
                         <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><rect x="3" y="2" width="3.5" height="12" rx="1" /><rect x="9.5" y="2" width="3.5" height="12" rx="1" /></svg>
@@ -321,6 +340,12 @@ export const PlayMode: React.FC<PlayModeProps> = ({ chart, audio, title, difficu
                     </span>
                     {portrait && <span className="text-[13px] text-[#fbbf24]">建议把 iPad 横过来玩</span>}
                 </button>
+            )}
+
+            {phase === 'countdown' && (
+                <div className="pointer-events-none absolute inset-0 flex items-center justify-center">
+                    <span key={countdown} className="text-[96px] font-bold text-white/90 drop-shadow-[0_0_24px_rgba(0,0,0,.6)] animate-pulse">{countdown}</span>
+                </div>
             )}
 
             {phase === 'paused' && (

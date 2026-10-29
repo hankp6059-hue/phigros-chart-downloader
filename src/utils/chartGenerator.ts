@@ -373,6 +373,9 @@ const PROFILES: Record<GeneratorDifficulty, DifficultyProfile> = {
     AT: { subdivision: 4, density: 8.7, minGap: 0.25, speed: 1.3, spread: 6.5, chordRate: 0.32, flickRate: 0.06, dragRate: 0.18, holdRate: 0.09, minHold: 0.5, grid: 0, sameHand: 0.12, handSpeed: 21 },
 };
 
+// below this placement probability a position is left empty however few notes there are
+const MIN_PLACEMENT = 0.1;
+
 interface FingeringProfile {
     /** fingers per hand */
     fingers: number;
@@ -382,13 +385,43 @@ interface FingeringProfile {
     fingerGap: number;
     /** chords compared with the difficulty's rate */
     chordScale: number;
+    /** per difficulty: notes compared with the difficulty's density */
+    density: Record<GeneratorDifficulty, number>;
+    /** per difficulty: share of notes that are chords of three */
+    triple: Record<GeneratorDifficulty, number>;
+    /** per difficulty: chance that a note in a fast run stays on the same hand (the next finger along) */
+    roll: Record<GeneratorDifficulty, number>;
+    /** per difficulty: lowest placement probability that still gets a note (fast runs need more of them) */
+    minPlacement: Record<GeneratorDifficulty, number>;
+    /** holds compared with the difficulty's rate */
+    holdScale: number;
+    /** holds that may be held at once (one per hand at most) */
+    maxHolds: number;
+    /** whether weak hits under a hold are kept (another finger of the holding hand can play them) */
+    keepUnderHolds: boolean;
 }
 
+const NONE = { EZ: 0, HD: 0, IN: 0, AT: 0 };
+
+// multi-finger figures are matched to the 20 official charts rated 17 and above, which are written for
+// several fingers (medians: 10.5 notes per second, 2-note chords 28% and 3+ note chords 7% of hit times,
+// three or more fingers down at 15% of hit times, 10% of notes played under a hold, a quarter of those
+// by the holding hand, a quarter of quick taps rolled across one hand). charts of level 13-14 show none
+// of the three-finger patterns, and the single-finger style keeps to them
 const FINGERING: Record<FingeringStyle, FingeringProfile> = {
     // two thumbs (or index fingers): every finger is a hand
-    single: { fingers: 1, span: 0, fingerGap: 0, chordScale: 1 },
+    single: { fingers: 1, span: 0, fingerGap: 0, chordScale: 1, density: { EZ: 1, HD: 1, IN: 1, AT: 1 }, triple: NONE, roll: NONE, minPlacement: { EZ: MIN_PLACEMENT, HD: MIN_PLACEMENT, IN: MIN_PLACEMENT, AT: MIN_PLACEMENT }, holdScale: 1, maxHolds: 1, keepUnderHolds: false },
     // tablet: index, middle and ring finger of each hand, side by side within about a third of the screen
-    multi: { fingers: 3, span: 5.5, fingerGap: 0.07, chordScale: 1.4 },
+    multi: {
+        fingers: 3, span: 5.5, fingerGap: 0.07, chordScale: 1.3,
+        density: { EZ: 1, HD: 1.1, IN: 1.3, AT: 1.5 },
+        triple: { EZ: 0, HD: 0.02, IN: 0.07, AT: 0.13 },
+        roll: { EZ: 0, HD: 0.2, IN: 0.3, AT: 0.35 },
+        minPlacement: { EZ: MIN_PLACEMENT, HD: 0.08, IN: 0.05, AT: 0.03 },
+        holdScale: 2,
+        maxHolds: 2,
+        keepUnderHolds: true,
+    },
 };
 
 // official charts span their constant events across the whole song with these bounds
@@ -420,8 +453,6 @@ const SPAN_MEMORY = 0.5;
 const ALTERNATE_SECONDS = 0.3;
 const SILENCE = 0.04;
 const MIN_ONSET = 0.12;
-// below this placement probability a position is left empty however few notes there are
-const MIN_PLACEMENT = 0.1;
 const SEMITONE = 1 / 12;
 
 // least-squares fit of official difficulty constants on note features (516 official charts,
@@ -488,6 +519,8 @@ interface PlannedNote {
     holdSlots: number;
     x: number;
     chord: boolean;
+    /** a chord of three */
+    triple?: boolean;
 }
 
 /** Takes the best `rate` share of `candidates` (by score, highest first) that pass `accept`. */
@@ -660,14 +693,14 @@ export const generateChart = (analysis: AudioAnalysis, options: GeneratorOptions
     while (tempo < 115) tempo *= 2;
     while (tempo > 260) tempo /= 2;
     const tempoFactor = Math.min(1.4, Math.max(0.6, (tempo / 175) ** 0.75));
-    const target = Math.round((profile.density * tempoFactor * activeSlots * slotSeconds) / (1 + chordRate));
+    const target = Math.round((profile.density * style.density[options.difficulty] * tempoFactor * activeSlots * slotSeconds) / (1 + chordRate));
     const gapSlots = Math.max(1, Math.round(profile.minGap * sub));
     const order = Array.from({ length: slotCount }, (_, i) => i).sort((a, b) => scores[b] - scores[a]);
     const taken = new Uint8Array(slotCount);
     const picked: number[] = [];
     for (const slot of order) {
         // a quiet song gets fewer notes (and a lower rating) rather than notes on nothing
-        if (picked.length >= target || scores[slot] < (learned ? MIN_PLACEMENT : MIN_ONSET)) break;
+        if (picked.length >= target || scores[slot] < (learned ? style.minPlacement[options.difficulty] : MIN_ONSET)) break;
         let free = true;
         for (let s = slot - gapSlots + 1; s < slot + gapSlots && free; s++) {
             if (s >= 0 && s < slotCount && taken[s]) free = false;
@@ -720,13 +753,13 @@ export const generateChart = (analysis: AudioAnalysis, options: GeneratorOptions
     });
     const holdStep = Math.max(1, sub / 2);
     const minHoldSlots = Math.max(1, Math.round(profile.minHold * sub));
-    // one hand holds while the other plays, so holds never overlap each other
+    // one hand holds while the other plays, so with one finger per hand holds never overlap each other
     const holdSpans: [number, number][] = [];
     const acceptHold = (i: number) => {
         if (sustain[i] < minHoldSlots) return false;
         const from = notes[i].slot;
         const to = from + sustain[i];
-        if (holdSpans.some(([start, end]) => from <= end && to >= start)) return false;
+        if (holdSpans.filter(([start, end]) => from <= end && to >= start).length >= style.maxHolds) return false;
         holdSpans.push([from, to]);
         return true;
     };
@@ -734,7 +767,7 @@ export const generateChart = (analysis: AudioAnalysis, options: GeneratorOptions
         notes[i].type = 3;
         notes[i].holdSlots = Math.max(minHoldSlots, sustain[i] - (sustain[i] % holdStep));
     };
-    for (const i of takeTop(notes.map((_, i) => i), total, profile.holdRate, i => sustain[i], acceptHold)) makeHold(i);
+    for (const i of takeTop(notes.map((_, i) => i), total, profile.holdRate * style.holdScale, i => sustain[i], acceptHold)) makeHold(i);
     // official charts string sustained notes together: weak hits under a hold are left out, and a held
     // tone right after a hold becomes one too
     const covered = new Uint8Array(notes.length);
@@ -742,7 +775,7 @@ export const generateChart = (analysis: AudioAnalysis, options: GeneratorOptions
         if (notes[i].type !== 3) continue;
         const end = notes[i].slot + notes[i].holdSlots;
         for (let j = i + 1; j < notes.length && notes[j].slot < end; j++) {
-            if (notes[j].type === 1 && notes[j].strength < 0.6 * notes[i].strength) covered[j] = 1;
+            if (!style.keepUnderHolds && notes[j].type === 1 && notes[j].strength < 0.6 * notes[i].strength) covered[j] = 1;
         }
         const next = notes.findIndex((n, j) => j > i && !covered[j] && n.slot >= end);
         if (next > 0 && notes[next].type === 1 && acceptHold(next)) makeHold(next);
@@ -795,6 +828,11 @@ export const generateChart = (analysis: AudioAnalysis, options: GeneratorOptions
     // chords on the strongest remaining taps
     for (const i of takeTop(notes.map((_, i) => i), total, chordRate, i => notes[i].strength, i => notes[i].type === 1)) {
         notes[i].chord = true;
+    }
+    // with several fingers the strongest chords take a third note
+    const tripleRate = style.triple[options.difficulty];
+    if (tripleRate) {
+        for (const i of takeTop(notes.map((_, i) => i), total, tripleRate, i => notes[i].strength, i => notes[i].chord)) notes[i].triple = true;
     }
 
     const motion = options.lineMotion === false ? undefined : buildLineMotion(analysis, {
@@ -965,7 +1003,8 @@ export const generateChart = (analysis: AudioAnalysis, options: GeneratorOptions
         if (lastHand < 0) preferred = pitchRank(note.pitch) >= 0.5 ? 1 : 0;
         // streams go hand to hand; with several fingers a short stepwise run rolls across one hand
         else if (time - lastTime < ALTERNATE_SECONDS) {
-            preferred = style.fingers > 1 && sameHandRun < style.fingers && Math.abs(step) >= 0.5 && Math.abs(step) <= 3 ? lastHand : 1 - lastHand;
+            const roll = style.fingers > 1 && sameHandRun < style.fingers && random() < style.roll[options.difficulty];
+            preferred = roll ? lastHand : 1 - lastHand;
         } else {
             preferred = step >= 1 ? 1 : step <= -1 ? 0 : lastHand;
             // keep both hands working
@@ -1044,6 +1083,27 @@ export const generateChart = (analysis: AudioAnalysis, options: GeneratorOptions
 
         placed.push({ time, end, x: note.x, type: note.type });
         play(hand, note.x, time, end, note.type, note.pitch);
+
+        if (note.chord && note.triple) {
+            // a third finger, on whichever hand has one free, next to that hand's note and inside its span
+            const together = placed.filter(p => Math.abs(p.time - time) < 1e-6);
+            for (const h of [0, 1].sort((a, b) => busyFingers(a, 1, time).length - busyFingers(b, 1, time).length)) {
+                if (busyFingers(h, 1, time).length >= style.fingers) continue;
+                const [low, high] = handRange(h, time, minX, maxX);
+                const taken = busyFingers(h, 1, time);
+                const own = taken.filter(c => Math.abs(c.time - time) < 1e-6);
+                const anchor = own.length ? own[own.length - 1].x : hands[h].x;
+                const clear = (candidate: number) => [...neighbours, ...together].every(p => Math.abs(p.x - candidate) >= NOTE_GAP + 0.01)
+                    && taken.every(c => Math.abs(c.x - candidate) >= NOTE_GAP + 0.01);
+                const third = findSpot(anchor + (h === 1 ? 1 : -1) * 2.5, low, high, clear);
+                if (third === null) continue;
+                const tx = Math.round(third * 100) / 100;
+                chords.push({ ...note, x: tx });
+                placed.push({ time, end: time, x: tx, type: note.type });
+                play(h, tx, time, time, note.type, note.pitch);
+                break;
+            }
+        }
         sameHandRun = hand === lastHand ? sameHandRun + 1 : 1;
         lastHand = hand;
         lastTime = time;
