@@ -10,6 +10,8 @@ import { encodeOgg } from '../utils/oggEncode';
 import type { BarState } from '../utils/lineMotion';
 import {
     AudioAnalysis,
+    FINGERING_STYLES,
+    FingeringStyle,
     GENERATOR_DIFFICULTIES,
     GeneratorDifficulty,
     analyzeAudio,
@@ -32,6 +34,12 @@ const MOOD_LABELS: Record<BarState, string> = {
 };
 const MOOD_COLORS: Record<BarState, string> = {
     silent: '#334155', calm: '#60a5fa', groove: '#2dd4bf', build: '#fbbf24', drop: '#f43f5e', climax: '#e879f9',
+};
+
+const FINGERING_LABELS: Record<FingeringStyle, string> = { single: '双手单指', multi: '双手多指' };
+const FINGERING_HINTS: Record<FingeringStyle, string> = {
+    single: '手机双拇指：每只手一个手指，快速连打左右交互',
+    multi: '平板多指：每只手三指，可单手滚键、按住 Hold 时同手点键，双押更多',
 };
 
 const fileExtension = (file: File, fallback: string) => {
@@ -101,6 +109,7 @@ export const CustomSongPopup: React.FC<CustomSongPopupProps> = ({ isOpen, onClos
     }, [latencyInput]);
     const [lineMotion, setLineMotion] = useState(true);
     const [speedChanges, setSpeedChanges] = useState(true);
+    const [fingering, setFingering] = useState<FingeringStyle>('single');
 
     useEffect(() => {
         if (!coverFile) {
@@ -156,8 +165,9 @@ export const CustomSongPopup: React.FC<CustomSongPopupProps> = ({ isOpen, onClos
             seed: `${name}|${audioFile?.size ?? 0}`,
             lineMotion,
             speedChanges,
+            fingering,
         })])) as Record<GeneratorDifficulty, ReturnType<typeof generateChart>>;
-    }, [analysis, bpmValid, bpm, offsetMs, name, audioFile, lineMotion, speedChanges]);
+    }, [analysis, bpmValid, bpm, offsetMs, name, audioFile, lineMotion, speedChanges, fingering]);
     const generated = charts?.[difficulty] ?? null;
 
     const level = levelOverride ?? (generated ? String(generated.level) : '');
@@ -310,6 +320,21 @@ export const CustomSongPopup: React.FC<CustomSongPopupProps> = ({ isOpen, onClos
 
                 {analysis && (
                     <div className="flex flex-col gap-2">
+                        <div className="flex flex-wrap items-center gap-2 text-[13px] text-slate-300">
+                            指法
+                            {FINGERING_STYLES.map(style => (
+                                <button
+                                    key={style}
+                                    type="button"
+                                    title={FINGERING_HINTS[style]}
+                                    onClick={() => setFingering(style)}
+                                    className={`h-8 px-3 rounded-lg border text-[13px] transition-colors ${fingering === style ? 'border-[#22d3ee]/60 bg-[#22d3ee]/10 text-white' : 'border-white/[.08] bg-white/[.04] text-slate-400 hover:text-slate-200'}`}
+                                >
+                                    {FINGERING_LABELS[style]}
+                                </button>
+                            ))}
+                            <span className="text-[12px] text-slate-500">{FINGERING_HINTS[fingering]}</span>
+                        </div>
                         <label className="flex items-center gap-2 text-[13px] text-slate-300">
                             <input type="checkbox" checked={lineMotion} onChange={e => setLineMotion(e.target.checked)} className="accent-[#22d3ee]" />
                             判定线随歌曲情绪运动
@@ -345,7 +370,7 @@ export const CustomSongPopup: React.FC<CustomSongPopupProps> = ({ isOpen, onClos
                 )}
 
                 <p className="text-[12px] leading-[1.6] text-slate-500 text-pretty">
-                    音符放在哪里，由一个从 240 首官方谱面（曲库的 73%）里学到的模型决定，模仿谱师的取舍。键位按官方谱面的双手（双拇指）习惯来排：左手负责左半屏、右手负责右半屏，两手永不交叉；
+                    音符放在哪里，由一个从 240 首官方谱面（曲库的 73%）里学到的模型决定，模仿谱师的取舍。键位按官方谱面的双手习惯来排，可选「双手单指」（手机双拇指）或「双手多指」（平板，每只手三指）：左手负责左半屏、右手负责右半屏，两手永不交叉；
                     快于单手连打的音符左右交互，慢一些时旋律上行交给右手、下行交给左手，每只手顺着旋律从上一个位置移动，移动距离不超过手指在这段时间里能到达的范围；
                     双押一手一个，Hold 由一只手按住时其余音符全部交给另一只手，音符之间不会重叠。最强的重音是红色 Flick，轻打和快速连音是黄色 Drag，
                     持续的长音是 Hold，其余是蓝色 Tap。流速跟着段落走：平缓、静默段放慢，铺垫段逐拍加速，爆发和高潮段提速（EZ 变化更小）。判定线按每小节的情绪运动：平缓处呼吸、律动处摇摆、铺垫时蓄力倾斜、爆发时回正下砸，

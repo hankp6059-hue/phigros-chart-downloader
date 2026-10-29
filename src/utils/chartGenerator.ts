@@ -11,6 +11,11 @@ export type GeneratorDifficulty = 'EZ' | 'HD' | 'IN' | 'AT';
 
 export const GENERATOR_DIFFICULTIES: GeneratorDifficulty[] = ['EZ', 'HD', 'IN', 'AT'];
 
+/** how the chart is meant to be played: one finger per hand (two thumbs, on a phone) or several (on a tablet) */
+export type FingeringStyle = 'single' | 'multi';
+
+export const FINGERING_STYLES: FingeringStyle[] = ['single', 'multi'];
+
 export interface AudioAnalysis {
     duration: number;
     /** seconds per envelope frame */
@@ -48,6 +53,8 @@ export interface GeneratorOptions {
     learnedPlacement?: boolean;
     /** change the scroll speed with the music (default true) */
     speedChanges?: boolean;
+    /** fingers per hand the chart is written for (default 'single') */
+    fingering?: FingeringStyle;
 }
 
 export interface GeneratedChart {
@@ -366,6 +373,24 @@ const PROFILES: Record<GeneratorDifficulty, DifficultyProfile> = {
     AT: { subdivision: 4, density: 8.7, minGap: 0.25, speed: 1.3, spread: 6.5, chordRate: 0.32, flickRate: 0.06, dragRate: 0.18, holdRate: 0.09, minHold: 0.5, grid: 0, sameHand: 0.12, handSpeed: 21 },
 };
 
+interface FingeringProfile {
+    /** fingers per hand */
+    fingers: number;
+    /** widest stretch between the fingers of one hand, in positionX units */
+    span: number;
+    /** shortest time between two taps by different fingers of the same hand, in seconds */
+    fingerGap: number;
+    /** chords compared with the difficulty's rate */
+    chordScale: number;
+}
+
+const FINGERING: Record<FingeringStyle, FingeringProfile> = {
+    // two thumbs (or index fingers): every finger is a hand
+    single: { fingers: 1, span: 0, fingerGap: 0, chordScale: 1 },
+    // tablet: index, middle and ring finger of each hand, side by side within about a third of the screen
+    multi: { fingers: 3, span: 5.5, fingerGap: 0.07, chordScale: 1.4 },
+};
+
 // official charts span their constant events across the whole song with these bounds
 const EVENT_START = -999999;
 const EVENT_END = 1000000000;
@@ -389,6 +414,8 @@ const GLIDE_SECONDS = 0.3;
 const CENTER_REACH = 1.5;
 // a hand that played within this many seconds still has its finger down where it played
 const HAND_MEMORY = 0.8;
+// fingers of one hand used within this many seconds keep it in shape (within FingeringProfile.span)
+const SPAN_MEMORY = 0.5;
 // notes closer than this go hand to hand even when one hand could play both
 const ALTERNATE_SECONDS = 0.3;
 const SILENCE = 0.04;
@@ -565,6 +592,8 @@ const swingsInTriplets = (analysis: AudioAnalysis, bpm: number, firstBeat: numbe
 
 export const generateChart = (analysis: AudioAnalysis, options: GeneratorOptions): GeneratedChart => {
     const profile = PROFILES[options.difficulty];
+    const style = FINGERING[options.fingering ?? 'single'];
+    const chordRate = Math.min(0.5, profile.chordRate * style.chordScale);
     const random = createRandom(`${options.seed}|${options.difficulty}`);
     const { envelope, bassEnvelope, loudness, pitch, tone, frameSeconds, frameOrigin } = analysis;
     // songs in triplet feel get a grid with triplets as well as straight eighths (sixths of a beat)
@@ -631,7 +660,7 @@ export const generateChart = (analysis: AudioAnalysis, options: GeneratorOptions
     while (tempo < 115) tempo *= 2;
     while (tempo > 260) tempo /= 2;
     const tempoFactor = Math.min(1.4, Math.max(0.6, (tempo / 175) ** 0.75));
-    const target = Math.round((profile.density * tempoFactor * activeSlots * slotSeconds) / (1 + profile.chordRate));
+    const target = Math.round((profile.density * tempoFactor * activeSlots * slotSeconds) / (1 + chordRate));
     const gapSlots = Math.max(1, Math.round(profile.minGap * sub));
     const order = Array.from({ length: slotCount }, (_, i) => i).sort((a, b) => scores[b] - scores[a]);
     const taken = new Uint8Array(slotCount);
@@ -764,7 +793,7 @@ export const generateChart = (analysis: AudioAnalysis, options: GeneratorOptions
     }
 
     // chords on the strongest remaining taps
-    for (const i of takeTop(notes.map((_, i) => i), total, profile.chordRate, i => notes[i].strength, i => notes[i].type === 1)) {
+    for (const i of takeTop(notes.map((_, i) => i), total, chordRate, i => notes[i].strength, i => notes[i].type === 1)) {
         notes[i].chord = true;
     }
 
@@ -796,12 +825,14 @@ export const generateChart = (analysis: AudioAnalysis, options: GeneratorOptions
         return [Math.max(low, -profile.spread), Math.min(high, profile.spread)];
     };
 
-    // fingering, the way official charts are written for two hands (thumbs or index fingers): the left
-    // hand plays the left half of the screen, the right hand the right half, and they never cross.
-    // notes quicker than one hand can tap go hand to hand; otherwise a rising melody moves to the right
-    // hand and a falling one to the left. each hand follows the melody from where it last played, only
-    // as far as it can travel in the time it has. a chord takes one note per hand, and while one hand
-    // holds, the other plays everything else on its own side
+    // fingering, the way official charts are written for two hands: the left hand plays the left half
+    // of the screen, the right hand the right half, and they never cross. each hand has one finger (two
+    // thumbs, on a phone) or several side by side (on a tablet, see FINGERING). a finger that has just
+    // tapped needs profile.sameHand before it taps again, and one holding a hold is taken until it lets
+    // go, so quicker notes go to another finger: with one finger per hand that is the other hand (hand
+    // to hand), with several it can also be a neighbouring finger of the same hand, within its span.
+    // otherwise a rising melody moves to the right hand and a falling one to the left. each hand
+    // follows the melody from where it last played, only as far as it can travel in the time it has
     // pitch by rank, so the notes spread over the playfield however narrow the melody is
     const pitches = notes.map(n => n.pitch).sort((a, b) => a - b);
     const pitchRank = (value: number) => {
@@ -817,10 +848,12 @@ export const generateChart = (analysis: AudioAnalysis, options: GeneratorOptions
     const placed: { time: number; end: number; x: number; type: OfficialNote['type'] }[] = [];
     const chords: PlannedNote[] = [];
     const dropped = new Set<PlannedNote>();
-    interface Hand { x: number; time: number; end: number; type: OfficialNote['type']; pitch: number }
+    /** where a finger of a hand played: still down until `end` for a hold */
+    interface Contact { x: number; time: number; end: number }
+    interface Hand { x: number; time: number; end: number; type: OfficialNote['type']; pitch: number; contacts: Contact[] }
     const hands: Hand[] = [
-        { x: -profile.spread / 2, time: -Infinity, end: -Infinity, type: 1, pitch: NaN },
-        { x: profile.spread / 2, time: -Infinity, end: -Infinity, type: 1, pitch: NaN },
+        { x: -profile.spread / 2, time: -Infinity, end: -Infinity, type: 1, pitch: NaN, contacts: [] },
+        { x: profile.spread / 2, time: -Infinity, end: -Infinity, type: 1, pitch: NaN, contacts: [] },
     ];
     let lastHand = -1;
     let lastTime = -Infinity;
@@ -828,29 +861,44 @@ export const generateChart = (analysis: AudioAnalysis, options: GeneratorOptions
     let sameHandRun = 0;
     const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v));
 
-    const holdingAt = (h: number, time: number) => hands[h].end > time + 1e-6;
-    /** whether hand `h` can play a note of this type at `time` */
+    const isHeld = (c: Contact, time: number) => c.end > time + 1e-6;
+    /** drags of one hand in quick succession are one finger gliding along */
+    const glides = (h: number, type: OfficialNote['type'], time: number) => type === 2 && hands[h].type === 2 && time - hands[h].time < GLIDE_SECONDS;
+    /** fingers of hand `h` that are holding, or have tapped too recently to tap again, at `time` */
+    const busyFingers = (h: number, type: OfficialNote['type'], time: number) => {
+        const recovery = profile.sameHand * (type === 4 ? 1.3 : 1) - 1e-6;
+        const gliding = glides(h, type, time);
+        return hands[h].contacts.filter(c => isHeld(c, time)
+            || (time - Math.max(c.time, c.end) < recovery && !(gliding && c.time === hands[h].time)));
+    };
+    /** whether a finger of hand `h` is free to play a note of this type at `time` */
     const canPlay = (h: number, type: OfficialNote['type'], time: number) => {
-        const hand = hands[h];
-        if (holdingAt(h, time)) return false;
-        // a drag string glides under one finger
-        if (type === 2 && hand.type === 2 && time - hand.time < GLIDE_SECONDS) return true;
-        return time - Math.max(hand.time, hand.end) >= profile.sameHand * (type === 4 ? 1.3 : 1) - 1e-6;
+        // the fingers of one hand still need a moment between their taps
+        if (style.fingers > 1 && time - hands[h].time < style.fingerGap - 1e-6 && !glides(h, type, time)) return false;
+        return busyFingers(h, type, time).length < style.fingers;
     };
     /** seconds since hand `h` last played (or let go of a hold) */
     const idleFor = (h: number, time: number) => time - Math.max(hands[h].time, hands[h].end);
+    /** fingers of hand `h` that are down, or were used within `memory` seconds */
+    const recentContacts = (h: number, time: number, memory: number) => hands[h].contacts.filter(c => isHeld(c, time) || time - c.end < memory);
     /** where hand `h` may play at `time`: its half of the screen, clear of the other hand while that one is in play, within reach */
     const handRange = (h: number, time: number, minX: number, maxX: number): [number, number] => {
-        const other = hands[1 - h];
         let low = h === 0 ? minX : Math.max(minX, -CENTER_REACH);
         let high = h === 0 ? Math.min(maxX, CENTER_REACH) : maxX;
-        if (holdingAt(1 - h, time) || time - other.time < HAND_MEMORY) {
-            if (h === 0) high = Math.min(high, other.x - NOTE_GAP - 0.01);
-            else low = Math.max(low, other.x + NOTE_GAP + 0.01);
+        for (const c of recentContacts(1 - h, time, HAND_MEMORY)) {
+            if (h === 0) high = Math.min(high, c.x - NOTE_GAP - 0.01);
+            else low = Math.max(low, c.x + NOTE_GAP + 0.01);
+        }
+        // the fingers of one hand stay within its span
+        if (style.fingers > 1) {
+            for (const c of recentContacts(h, time, SPAN_MEMORY)) {
+                low = Math.max(low, c.x - style.span);
+                high = Math.min(high, c.x + style.span);
+            }
         }
         const idle = idleFor(h, time);
         if (Number.isFinite(idle)) {
-            const reach = 1.5 + profile.handSpeed * Math.min(1, idle);
+            const reach = 1.5 + style.span + profile.handSpeed * clamp(idle, 0, 1);
             low = Math.max(low, hands[h].x - reach);
             high = Math.min(high, hands[h].x + reach);
         }
@@ -866,7 +914,7 @@ export const generateChart = (analysis: AudioAnalysis, options: GeneratorOptions
         // the same tone again from the same hand is a clean repeat on the same spot
         if (idle >= REPEAT_SECONDS && idle < 0.4 && hand.type !== 3 && Math.abs(note.pitch - hand.pitch) < SEMITONE / 2) x = hand.x;
         // drag strings glide from drag to drag instead of jumping
-        if (note.type === 2 && hand.type === 2 && time - hand.time < GLIDE_SECONDS) x = hand.x + clamp(x - hand.x, -1.2, 1.2);
+        if (glides(h, note.type, time)) x = hand.x + clamp(x - hand.x, -1.2, 1.2);
         return x;
     };
     const clearOf = (p: (typeof placed)[number], candidate: number, time: number) => {
@@ -887,6 +935,11 @@ export const generateChart = (analysis: AudioAnalysis, options: GeneratorOptions
         }
         return null;
     };
+    const play = (h: number, x: number, time: number, end: number, type: OfficialNote['type'], pitch: number) => {
+        const contacts = hands[h].contacts.filter(c => isHeld(c, time) || time - c.end < HAND_MEMORY);
+        contacts.push({ x, time, end });
+        hands[h] = { x, time, end: Math.max(end, hands[h].end), type, pitch, contacts };
+    };
 
     for (const note of notes) {
         const time = slotTime(note.slot);
@@ -894,9 +947,9 @@ export const generateChart = (analysis: AudioAnalysis, options: GeneratorOptions
         const neighbours = placed.filter(p => time - p.time < CLOSE_SECONDS + ROUNDING_MARGIN || p.end > time);
 
         let playable = [0, 1].filter(h => canPlay(h, note.type, time));
-        // too quick for either hand: a light hit becomes a drag the free finger just slides onto
+        // too quick for every finger: a light hit becomes a drag a free finger just slides onto
         if (!playable.length && note.type !== 3) {
-            const free = [0, 1].filter(h => !holdingAt(h, time) && idleFor(h, time) >= 0.06);
+            const free = [0, 1].filter(h => hands[h].contacts.filter(c => isHeld(c, time)).length < style.fingers && time - hands[h].time >= 0.06);
             if (free.length) {
                 note.type = 2;
                 playable = free;
@@ -908,28 +961,29 @@ export const generateChart = (analysis: AudioAnalysis, options: GeneratorOptions
         }
 
         let preferred: number;
+        const step = (note.pitch - lastPitch) * 12;
         if (lastHand < 0) preferred = pitchRank(note.pitch) >= 0.5 ? 1 : 0;
-        // streams go hand to hand
-        else if (time - lastTime < ALTERNATE_SECONDS) preferred = 1 - lastHand;
-        else {
-            const step = (note.pitch - lastPitch) * 12;
+        // streams go hand to hand; with several fingers a short stepwise run rolls across one hand
+        else if (time - lastTime < ALTERNATE_SECONDS) {
+            preferred = style.fingers > 1 && sameHandRun < style.fingers && Math.abs(step) >= 0.5 && Math.abs(step) <= 3 ? lastHand : 1 - lastHand;
+        } else {
             preferred = step >= 1 ? 1 : step <= -1 ? 0 : lastHand;
             // keep both hands working
             if (preferred === lastHand && sameHandRun >= 4) preferred = 1 - lastHand;
         }
         const order = playable.includes(preferred) ? [preferred, ...playable.filter(h => h !== preferred)] : playable;
 
-        // a chord needs both hands free
-        if (note.chord && !(canPlay(0, 1, time) && canPlay(1, 1, time))) note.chord = false;
-
         let hand = -1;
         let x = 0;
         for (const h of order) {
             const [low, high] = handRange(h, time, minX, maxX);
             // the drag right before a gliding drag of the same hand is meant to be close
-            const gliding = note.type === 2 && hands[h].type === 2 && time - hands[h].time < GLIDE_SECONDS;
+            const gliding = glides(h, note.type, time);
             const blocking = neighbours.filter(p => !(gliding && p.time === hands[h].time && p.type === 2));
-            const ok = (candidate: number) => blocking.every(p => clearOf(p, candidate, time));
+            // a spot one of the hand's fingers is still on (or has only just left) is that finger's, not another's
+            const taken = style.fingers > 1 ? busyFingers(h, note.type, time) : [];
+            const ok = (candidate: number) => blocking.every(p => clearOf(p, candidate, time))
+                && taken.every(c => Math.abs(c.x - candidate) >= NOTE_GAP + 0.01);
             let spot = findSpot(melodicX(h, note, time), low, high, ok);
             if (spot === null) continue;
             if (profile.grid) {
@@ -943,34 +997,53 @@ export const generateChart = (analysis: AudioAnalysis, options: GeneratorOptions
             x = spot;
             break;
         }
-        // no room for either hand: one note fewer is better than two on top of each other
+        // no room for any finger: one note fewer is better than two on top of each other
         if (hand < 0) {
             dropped.add(note);
             continue;
         }
         note.x = Math.round(x * 100) / 100;
+        const end = note.type === 3 ? slotTime(note.slot + note.holdSlots) : time;
 
         if (note.chord) {
-            // the other hand takes the partner, on its own side, about 4-8 units away (official chords sit
-            // about 6 apart), as far as it can reach from where it last played
+            // the partner goes to the other hand, on its own side, about 4-8 units away (official chords sit
+            // about 6 apart); with several fingers a hand can also take both notes, within its span
+            let partner: number | null = null;
+            let partnerHand = -1;
+            const clearSpot = (h: number) => {
+                // as for any note, a spot a finger of that hand has only just left is that finger's
+                const taken = busyFingers(h, 1, time);
+                return (candidate: number) => neighbours.every(p => Math.abs(p.x - candidate) >= NOTE_GAP + 0.01)
+                    && taken.every(c => Math.abs(c.x - candidate) >= NOTE_GAP + 0.01)
+                    && Math.abs(candidate - note.x) >= NOTE_GAP + 0.01;
+            };
             const other = 1 - hand;
-            const [minOther, maxOther] = handRange(other, time, minX, maxX);
-            const [low, high] = other === 1 ? [Math.max(minOther, note.x + 3.5), maxOther] : [minOther, Math.min(maxOther, note.x - 3.5)];
-            const wanted = note.x + (other === 1 ? 1 : -1) * (4 + random() * 4);
-            const partner = findSpot(wanted, low, high, candidate => neighbours.every(p => Math.abs(p.x - candidate) >= NOTE_GAP + 0.01));
+            if (canPlay(other, 1, time)) {
+                const [minOther, maxOther] = handRange(other, time, minX, maxX);
+                const [low, high] = other === 1 ? [Math.max(minOther, note.x + 3.5), maxOther] : [minOther, Math.min(maxOther, note.x - 3.5)];
+                partner = findSpot(note.x + (other === 1 ? 1 : -1) * (4 + random() * 4), low, high, clearSpot(other));
+                partnerHand = other;
+            }
+            if (partner === null && style.fingers > 1 && busyFingers(hand, 1, time).length + 1 < style.fingers) {
+                const [low, high] = handRange(hand, time, minX, maxX);
+                const outward = hand === 1 ? 1 : -1;
+                const clear = clearSpot(hand);
+                const span = (candidate: number) => clear(candidate) && Math.abs(candidate - note.x) <= style.span;
+                partner = findSpot(note.x + outward * 3, Math.max(low, note.x - style.span), Math.min(high, note.x + style.span), span);
+                partnerHand = hand;
+            }
             if (partner === null) {
                 note.chord = false;
             } else {
                 const px = Math.round(partner * 100) / 100;
                 chords.push({ ...note, x: px });
                 placed.push({ time, end: time, x: px, type: note.type });
-                hands[other] = { x: px, time, end: time, type: note.type, pitch: note.pitch };
+                play(partnerHand, px, time, time, note.type, note.pitch);
             }
         }
 
-        const end = note.type === 3 ? slotTime(note.slot + note.holdSlots) : time;
         placed.push({ time, end, x: note.x, type: note.type });
-        hands[hand] = { x: note.x, time, end, type: note.type, pitch: note.pitch };
+        play(hand, note.x, time, end, note.type, note.pitch);
         sameHandRun = hand === lastHand ? sameHandRun + 1 : 1;
         lastHand = hand;
         lastTime = time;
