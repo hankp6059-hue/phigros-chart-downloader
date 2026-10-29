@@ -125,7 +125,9 @@ const onsetEnvelope = (flux: Float32Array, frameSeconds: number) => {
     return envelope;
 };
 
-export const analyzeAudio = (channels: Float32Array[], sampleRate: number): AudioAnalysis => {
+const TEMPO_PRIOR = 140;
+
+export const analyzeAudio = (channels: Float32Array[], sampleRate: number, tempoPrior = TEMPO_PRIOR): AudioAnalysis => {
     const length = channels[0].length;
     const mono = new Float32Array(length);
     for (const channel of channels) {
@@ -203,7 +205,9 @@ export const analyzeAudio = (channels: Float32Array[], sampleRate: number): Audi
         }
         // parabolic interpolation between neighbouring bins
         const [a, b, c] = [pitchMagnitude[peakBin - 1], pitchMagnitude[peakBin], pitchMagnitude[peakBin + 1]];
-        const shift = a - 2 * b + c === 0 ? 0 : (0.5 * (a - c)) / (a - 2 * b + c);
+        // a true peak lies within half a bin; flat spectra (silence) would otherwise throw it anywhere
+        const curvature = a - 2 * b + c;
+        const shift = curvature < 0 ? Math.max(-0.5, Math.min(0.5, (0.5 * (a - c)) / curvature)) : 0;
         pitch[f] = Math.log2(((peakBin + shift) * sampleRate) / pitchSize);
         tone[f] = Math.hypot(pitchRe[peakBin], pitchIm[peakBin]);
         [previous, current] = [current, previous];
@@ -228,10 +232,11 @@ export const analyzeAudio = (channels: Float32Array[], sampleRate: number): Audi
     // coarse tempo: favour tempos whose eighth notes also line up, weighted towards common tempos
     let coarse = 120;
     let best = -Infinity;
-    for (let bpm = 70; bpm <= 210; bpm += 0.5) {
+    // Phigros-style songs run fast: search up to 260 BPM, leaning towards ~140
+    for (let bpm = 70; bpm <= 260; bpm += 0.5) {
         const fundamental = gridAlignment(beatEnvelope, frameSeconds, frameOrigin, bpm).strength;
         const eighths = gridAlignment(beatEnvelope, frameSeconds, frameOrigin, bpm * 2).strength;
-        const prior = Math.exp(-0.5 * (Math.log2(bpm / 140) / 0.6) ** 2);
+        const prior = Math.exp(-0.5 * (Math.log2(bpm / tempoPrior) / 0.6) ** 2);
         const score = (fundamental + 0.5 * eighths) * (0.6 + 0.4 * prior);
         if (score > best) {
             best = score;
@@ -251,7 +256,7 @@ export const analyzeAudio = (channels: Float32Array[], sampleRate: number): Audi
     }
     // most songs use whole-number tempos
     const rounded = Math.round(bpm);
-    if (gridAlignment(beatEnvelope, frameSeconds, frameOrigin, rounded).strength >= best * 0.97) bpm = rounded;
+    if (gridAlignment(beatEnvelope, frameSeconds, frameOrigin, rounded).strength >= best * 0.95) bpm = rounded;
     else bpm = Math.round(bpm * 100) / 100;
 
     // the full-band grid can lock onto off-beats (hi-hats are broadband), so pick the quarter-beat
@@ -335,13 +340,19 @@ interface DifficultyProfile {
     flickRate: number;
     dragRate: number;
     holdRate: number;
+    /** shortest hold, in beats */
+    minHold: number;
+    /** positions snap to this step (0 = free) */
+    grid: number;
+    /** chance that a quick note on the same side as the last one switches hands */
+    alternate: number;
 }
 
 const PROFILES: Record<GeneratorDifficulty, DifficultyProfile> = {
-    EZ: { subdivision: 2, density: 2.2, minGap: 0.5, speed: 0.9, spread: 5.5, chordRate: 0.05, flickRate: 0.05, dragRate: 0.35, holdRate: 0.1 },
-    HD: { subdivision: 4, density: 4.3, minGap: 0.25, speed: 1.0, spread: 6.5, chordRate: 0.1, flickRate: 0.05, dragRate: 0.32, holdRate: 0.08 },
-    IN: { subdivision: 4, density: 6.7, minGap: 0.25, speed: 1.15, spread: 7.5, chordRate: 0.18, flickRate: 0.06, dragRate: 0.22, holdRate: 0.09 },
-    AT: { subdivision: 4, density: 9.6, minGap: 0.25, speed: 1.3, spread: 7.5, chordRate: 0.28, flickRate: 0.06, dragRate: 0.18, holdRate: 0.09 },
+    EZ: { subdivision: 2, density: 2.2, minGap: 0.5, speed: 0.9, spread: 5.5, chordRate: 0.05, flickRate: 0.05, dragRate: 0.35, holdRate: 0.1, minHold: 1, grid: 0.5, alternate: 0.45 },
+    HD: { subdivision: 4, density: 4.3, minGap: 0.25, speed: 1.0, spread: 6, chordRate: 0.14, flickRate: 0.05, dragRate: 0.32, holdRate: 0.08, minHold: 1, grid: 0.5, alternate: 0.4 },
+    IN: { subdivision: 4, density: 6.7, minGap: 0.25, speed: 1.15, spread: 6.25, chordRate: 0.24, flickRate: 0.06, dragRate: 0.22, holdRate: 0.09, minHold: 0.5, grid: 0, alternate: 0.4 },
+    AT: { subdivision: 4, density: 9.6, minGap: 0.25, speed: 1.3, spread: 6.5, chordRate: 0.32, flickRate: 0.06, dragRate: 0.18, holdRate: 0.09, minHold: 0.5, grid: 0, alternate: 0.4 },
 };
 
 // official charts span their constant events across the whole song with these bounds
@@ -355,13 +366,20 @@ const SAFE_HEIGHT = 0.45 * 900;
 const UNIT = 1350 / 18;
 // notes are 1.8 units wide; anything closer than this in space and CLOSE_SECONDS in time would stack
 const NOTE_GAP = 2;
-const CLOSE_SECONDS = 0.3;
+const CLOSE_SECONDS = 0.18;
+// drag streams glide note to note within this gap
+const GLIDE_SECONDS = 0.3;
 const SILENCE = 0.04;
 const MIN_ONSET = 0.12;
 const SEMITONE = 1 / 12;
 
 // least-squares fit of official difficulty constants on note features (516 official charts,
 // mean error about ±1). Official charts also get harder through line motion, which this ignores.
+// generated charts use one judgment line and fewer chords than official ones, so the fit above
+// underrates their harder difficulties. offsets measured against official charts of the same 14 songs
+// (leave-one-out: IN error ±1.50 -> ±0.77); EZ/HD showed no gain. AT has no benchmark and follows IN.
+const LEVEL_CALIBRATION: Record<GeneratorDifficulty, number> = { EZ: 0, HD: 0, IN: 1.5, AT: 1.5 };
+
 const RATING_WEIGHTS = { intercept: 1.5455, logDensity: 3.1199, logPeakDensity: 3.3408, chord: 1.9774, drag: -7.4512 };
 
 /** Difficulty constant on the official scale, from note times (seconds) and types. */
@@ -432,11 +450,29 @@ const takeTop = <T>(candidates: T[], total: number, rate: number, score: (c: T) 
     return chosen;
 };
 
+/** Whether off-beat onsets fall on triplet positions more than on straight sixteenths. */
+const swingsInTriplets = (analysis: AudioAnalysis, bpm: number, firstBeat: number) => {
+    const { envelope, frameSeconds, frameOrigin } = analysis;
+    const beat = 60 / bpm;
+    const near = (fraction: number, targets: number[]) => targets.some(t => Math.abs(fraction - t) * beat < 0.025);
+    let triplet = 0;
+    let sixteenth = 0;
+    for (let f = 1; f + 1 < envelope.length; f++) {
+        if (envelope[f] < 0.3 || envelope[f] < envelope[f - 1] || envelope[f] < envelope[f + 1]) continue;
+        const beats = (frameOrigin + f * frameSeconds - firstBeat) / beat;
+        const fraction = ((beats % 1) + 1) % 1;
+        if (near(fraction, [1 / 3, 2 / 3, 1 / 6, 5 / 6])) triplet++;
+        else if (near(fraction, [0.25, 0.75])) sixteenth++;
+    }
+    return triplet > 1.2 * sixteenth && triplet > 20;
+};
+
 export const generateChart = (analysis: AudioAnalysis, options: GeneratorOptions): GeneratedChart => {
     const profile = PROFILES[options.difficulty];
     const random = createRandom(`${options.seed}|${options.difficulty}`);
     const { envelope, bassEnvelope, loudness, pitch, tone, frameSeconds, frameOrigin } = analysis;
-    const sub = profile.subdivision;
+    // songs in triplet feel get a grid with triplets as well as straight eighths (sixths of a beat)
+    const sub = profile.subdivision === 4 && swingsInTriplets(analysis, options.bpm, options.firstBeat) ? 6 : profile.subdivision;
     const beat = 60 / options.bpm;
     const slotSeconds = beat / sub;
     const firstBeat = ((options.firstBeat % beat) + beat) % beat;
@@ -445,6 +481,19 @@ export const generateChart = (analysis: AudioAnalysis, options: GeneratorOptions
     const slotTime = (slot: number) => firstBeat + slot * slotSeconds;
     const slotCount = Math.max(0, Math.floor((analysis.duration - 0.3 - firstBeat) / slotSeconds));
     const valueAt = (values: Float32Array, frame: number) => values[Math.max(0, Math.min(values.length - 1, frame))];
+
+    // how loud the music is around each moment (about a bar either side), 0..1: official charts pack
+    // their notes into the loud parts, so selection favours them
+    const loudnessSum = new Float64Array(loudness.length + 1);
+    for (let f = 0; f < loudness.length; f++) loudnessSum[f + 1] = loudnessSum[f] + loudness[f];
+    const sectionRadius = Math.max(1, Math.round((beat * 4) / frameSeconds));
+    const sectionLoudness = (frame: number) => {
+        const from = Math.max(0, frame - sectionRadius);
+        const to = Math.min(loudness.length, frame + sectionRadius);
+        return to > from ? (loudnessSum[to] - loudnessSum[from]) / (to - from) : 0;
+    };
+    let loudestSection = 1e-9;
+    for (let f = 0; f < loudness.length; f += sectionRadius) loudestSection = Math.max(loudestSection, sectionLoudness(f));
 
     // onset strength near each slot, weighted by metric position so strong beats win ties
     const tolerance = Math.max(1, Math.round(0.035 / frameSeconds));
@@ -465,12 +514,18 @@ export const generateChart = (analysis: AudioAnalysis, options: GeneratorOptions
         if (loud < SILENCE) continue;
         activeSlots++;
         const position = slot % sub;
-        const metric = position === 0 ? 1 : position * 2 === sub ? 0.85 : 0.7;
-        strengths[slot] = peak * metric;
+        const metric = position === 0 ? 1 : position * 2 === sub ? 0.85 : (position * 3) % sub === 0 ? 0.8 : 0.7;
+        const section = Math.min(1, sectionLoudness(center) / loudestSection);
+        strengths[slot] = peak * metric * (0.35 + 1.3 * section);
     }
 
     // rhythm: greedily take the strongest onsets while respecting the minimum gap
-    const target = Math.round((profile.density * activeSlots * slotSeconds) / (1 + profile.chordRate));
+    // official note density grows with tempo (notes per second ∝ BPM^0.75 around a median of 175)
+    let tempo = options.bpm;
+    while (tempo < 115) tempo *= 2;
+    while (tempo > 260) tempo /= 2;
+    const tempoFactor = Math.min(1.4, Math.max(0.6, (tempo / 175) ** 0.75));
+    const target = Math.round((profile.density * tempoFactor * activeSlots * slotSeconds) / (1 + profile.chordRate));
     const gapSlots = Math.max(1, Math.round(profile.minGap * sub));
     const order = Array.from({ length: slotCount }, (_, i) => i).sort((a, b) => strengths[b] - strengths[a]);
     const taken = new Uint8Array(slotCount);
@@ -529,19 +584,41 @@ export const generateChart = (analysis: AudioAnalysis, options: GeneratorOptions
         return length;
     });
     const holdStep = Math.max(1, sub / 2);
+    const minHoldSlots = Math.max(1, Math.round(profile.minHold * sub));
     // one hand holds while the other plays, so holds never overlap each other
     const holdSpans: [number, number][] = [];
     const acceptHold = (i: number) => {
-        if (sustain[i] < sub) return false;
+        if (sustain[i] < minHoldSlots) return false;
         const from = notes[i].slot;
         const to = from + sustain[i];
         if (holdSpans.some(([start, end]) => from <= end && to >= start)) return false;
         holdSpans.push([from, to]);
         return true;
     };
-    for (const i of takeTop(notes.map((_, i) => i), total, profile.holdRate, i => sustain[i], acceptHold)) {
+    const makeHold = (i: number) => {
         notes[i].type = 3;
-        notes[i].holdSlots = sustain[i] - (sustain[i] % holdStep);
+        notes[i].holdSlots = Math.max(minHoldSlots, sustain[i] - (sustain[i] % holdStep));
+    };
+    for (const i of takeTop(notes.map((_, i) => i), total, profile.holdRate, i => sustain[i], acceptHold)) makeHold(i);
+    // official charts string sustained notes together: weak hits under a hold are left out, and a held
+    // tone right after a hold becomes one too
+    const covered = new Uint8Array(notes.length);
+    for (let i = 0; i < notes.length; i++) {
+        if (notes[i].type !== 3) continue;
+        const end = notes[i].slot + notes[i].holdSlots;
+        for (let j = i + 1; j < notes.length && notes[j].slot < end; j++) {
+            if (notes[j].type === 1 && notes[j].strength < 0.6 * notes[i].strength) covered[j] = 1;
+        }
+        const next = notes.findIndex((n, j) => j > i && !covered[j] && n.slot >= end);
+        if (next > 0 && notes[next].type === 1 && acceptHold(next)) makeHold(next);
+    }
+    if (covered.some(Boolean)) {
+        const kept = notes.filter((_, j) => !covered[j]);
+        const keptSustain = sustain.filter((_, j) => !covered[j]);
+        notes.length = 0;
+        notes.push(...kept);
+        sustain.length = 0;
+        sustain.push(...keptSustain);
     }
 
     // flick (red): the hardest accents (sharpest jump in loudness), outside fast runs
@@ -552,9 +629,15 @@ export const generateChart = (analysis: AudioAnalysis, options: GeneratorOptions
         const jump = valueAt(loudness, onset + 2) - valueAt(loudness, onset - 3);
         return note.strength + 2 * Math.max(0, jump);
     };
-    for (const i of takeTop(notes.map((_, i) => i), total, profile.flickRate, i => accent(notes[i]),
+    for (const i of takeTop(notes.map((_, i) => i), total, profile.flickRate * 0.6, i => accent(notes[i]),
         i => notes[i].type === 1 && !inRun[i])) {
         notes[i].type = 4;
+    }
+    // flicks come in groups: a strong hit right after a flick often flicks too
+    for (let i = 0; i + 1 < notes.length; i++) {
+        const next = notes[i + 1];
+        if (notes[i].type === 4 && next.type === 1 && next.slot - notes[i].slot <= sub
+            && next.strength >= 0.5 * notes[i].strength && random() < 0.6) next.type = 4;
     }
 
     // drag (yellow): fast runs and light hits that move along the melody
@@ -565,6 +648,13 @@ export const generateChart = (analysis: AudioAnalysis, options: GeneratorOptions
     };
     for (const i of takeTop(notes.map((_, i) => i), total, profile.dragRate, dragScore, i => notes[i].type === 1)) {
         notes[i].type = 2;
+    }
+    // drags run in strings: a lone drag pulls in the light note after it, or goes back to a tap
+    for (let i = 0; i < notes.length; i++) {
+        if (notes[i].type !== 2 || notes[i - 1]?.type === 2 || notes[i + 1]?.type === 2) continue;
+        const next = notes[i + 1];
+        if (next && next.type === 1 && next.slot - notes[i].slot <= sub / 2) next.type = 2;
+        else notes[i].type = 1;
     }
 
     // chords on the strongest remaining taps
@@ -602,28 +692,37 @@ export const generateChart = (analysis: AudioAnalysis, options: GeneratorOptions
 
     // position follows pitch (low notes on the left, high on the right), but no note may come within
     // NOTE_GAP of a note that is still close in time, or of a hold that is still being held
+    // by pitch rank, so the notes spread over the playfield however narrow the melody is
     const pitches = notes.map(n => n.pitch).sort((a, b) => a - b);
-    let low = pitches[Math.floor(0.05 * (pitches.length - 1))] ?? 0;
-    let high = pitches[Math.floor(0.95 * (pitches.length - 1))] ?? 1;
-    if (high - low < 0.5) {
-        const middle = (high + low) / 2;
-        low = middle - 0.25;
-        high = middle + 0.25;
-    }
+    const pitchRank = (value: number) => {
+        let lo = 0;
+        let hi = pitches.length;
+        while (lo < hi) {
+            const mid = (lo + hi) >> 1;
+            if (pitches[mid] < value) lo = mid + 1;
+            else hi = mid;
+        }
+        return pitches.length > 1 ? lo / (pitches.length - 1) : 0.5;
+    };
     const placed: { time: number; end: number; x: number; type: OfficialNote['type'] }[] = [];
     const chords: PlannedNote[] = [];
-    let previous: { time: number; x: number; type: OfficialNote['type'] } | null = null;
+    let previous: { time: number; x: number; type: OfficialNote['type']; pitch: number } | null = null;
     let hold: { end: number; x: number } | null = null;
 
     for (const note of notes) {
         const time = slotTime(note.slot);
         const [minX, maxX] = reachAt(time);
-        const normalized = Math.min(1, Math.max(0, (note.pitch - low) / (high - low)));
-        let x = (normalized * 2 - 1) * profile.spread;
+        let x = (Math.min(1, pitchRank(note.pitch)) * 2 - 1) * profile.spread;
 
         // drag streams glide from drag to drag instead of jumping
-        const gliding = note.type === 2 && previous?.type === 2 && time - previous.time < CLOSE_SECONDS;
+        const gliding = note.type === 2 && previous?.type === 2 && time - previous.time < GLIDE_SECONDS;
         if (gliding) x = previous!.x + Math.max(-1.2, Math.min(1.2, x - previous!.x));
+        // quick notes often switch hands
+        // the same note again sits where it was (a repeat), otherwise quick notes often switch hands
+        else if (previous && time - previous.time < 0.4 && Math.abs(note.pitch - previous.pitch) < SEMITONE / 2) x = previous.x;
+        else if (previous && time - previous.time < 0.4 && Math.sign(x) === Math.sign(previous.x) && random() < profile.alternate) {
+            x = -Math.sign(previous.x || 1) * Math.max(1.5, Math.abs(x));
+        }
 
         // during a hold the other hand plays, on the other side of the screen
         const holding = hold && note.slot < hold.end ? hold : null;
@@ -651,17 +750,23 @@ export const generateChart = (analysis: AudioAnalysis, options: GeneratorOptions
             // a crowded moment: keep the pitch position rather than drop the note
             if (found !== null) x = found;
         }
+        if (profile.grid) {
+            const snapped = Math.round(x / profile.grid) * profile.grid;
+            if (fits(snapped) || !fits(x)) x = snapped;
+        }
         note.x = Math.round(x * 100) / 100;
 
         if (note.chord) {
             // the partner mirrors the note and must be clear of everything around it too
             const [partnerMin, partnerMax] = [minX, maxX];
             const clear = (candidate: number) => candidate >= partnerMin && candidate <= partnerMax
-                && Math.abs(candidate - note.x) >= 2 * NOTE_GAP
+                && Math.abs(candidate - note.x) >= 3.5
                 && blocking.every(p => Math.abs(p.x - candidate) >= NOTE_GAP);
-            let partner: number | null = clear(-note.x) ? -note.x : null;
+            // official chords sit about 6 units apart
+            const wanted = note.x - Math.sign(note.x || 1) * (4 + random() * 4);
+            let partner: number | null = clear(wanted) ? wanted : null;
             for (let step = 1; step <= 40 && partner === null; step++) {
-                for (const candidate of [-note.x + step * 0.25, -note.x - step * 0.25]) {
+                for (const candidate of [wanted + step * 0.25, wanted - step * 0.25]) {
                     if (clear(candidate)) {
                         partner = candidate;
                         break;
@@ -678,7 +783,7 @@ export const generateChart = (analysis: AudioAnalysis, options: GeneratorOptions
 
         const end = note.type === 3 ? slotTime(note.slot + note.holdSlots) : time;
         placed.push({ time, end, x: note.x, type: note.type });
-        previous = { time, x: note.x, type: note.type };
+        previous = { time, x: note.x, type: note.type, pitch: note.pitch };
         if (note.type === 3) hold = { end: note.slot + note.holdSlots, x: note.x };
     }
 
@@ -754,7 +859,7 @@ export const generateChart = (analysis: AudioAnalysis, options: GeneratorOptions
     return {
         chart,
         motion,
-        level: rateNotes(officialNotes.map(n => ({ time: toSeconds(n.time), type: n.type }))),
+        level: Math.round(Math.min(16.9, rateNotes(officialNotes.map(n => ({ time: toSeconds(n.time), type: n.type }))) + LEVEL_CALIBRATION[options.difficulty]) * 10) / 10,
         stats: { total: officialNotes.length, tap: count(1), drag: count(2), hold: count(3), flick: count(4) },
     };
 };
