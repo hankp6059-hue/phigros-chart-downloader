@@ -367,10 +367,10 @@ interface DifficultyProfile {
 }
 
 const PROFILES: Record<GeneratorDifficulty, DifficultyProfile> = {
-    EZ: { subdivision: 2, density: 1.75, minGap: 0.5, speed: 0.9, spread: 5.5, chordRate: 0.05, flickRate: 0.05, dragRate: 0.35, holdRate: 0.1, minHold: 1, grid: 0.5, sameHand: 0.4, handSpeed: 9 },
-    HD: { subdivision: 4, density: 3.9, minGap: 0.25, speed: 1.0, spread: 6, chordRate: 0.14, flickRate: 0.05, dragRate: 0.32, holdRate: 0.08, minHold: 1, grid: 0.5, sameHand: 0.22, handSpeed: 13 },
-    IN: { subdivision: 4, density: 6.1, minGap: 0.25, speed: 1.15, spread: 6.25, chordRate: 0.24, flickRate: 0.06, dragRate: 0.22, holdRate: 0.09, minHold: 0.5, grid: 0, sameHand: 0.15, handSpeed: 17 },
-    AT: { subdivision: 4, density: 8.7, minGap: 0.25, speed: 1.3, spread: 6.5, chordRate: 0.32, flickRate: 0.06, dragRate: 0.18, holdRate: 0.09, minHold: 0.5, grid: 0, sameHand: 0.12, handSpeed: 21 },
+    EZ: { subdivision: 2, density: 1.75, minGap: 0.5, speed: 0.9, spread: 5.5, chordRate: 0.05, flickRate: 0.06, dragRate: 0.35, holdRate: 0.1, minHold: 1, grid: 0.5, sameHand: 0.4, handSpeed: 9 },
+    HD: { subdivision: 4, density: 3.9, minGap: 0.25, speed: 1.0, spread: 6, chordRate: 0.14, flickRate: 0.07, dragRate: 0.32, holdRate: 0.08, minHold: 1, grid: 0.5, sameHand: 0.22, handSpeed: 13 },
+    IN: { subdivision: 4, density: 6.1, minGap: 0.25, speed: 1.15, spread: 6.25, chordRate: 0.24, flickRate: 0.09, dragRate: 0.22, holdRate: 0.09, minHold: 0.5, grid: 0, sameHand: 0.15, handSpeed: 17 },
+    AT: { subdivision: 4, density: 8.7, minGap: 0.25, speed: 1.3, spread: 6.5, chordRate: 0.32, flickRate: 0.09, dragRate: 0.18, holdRate: 0.09, minHold: 0.5, grid: 0, sameHand: 0.12, handSpeed: 21 },
 };
 
 // below this placement probability a position is left empty however few notes there are
@@ -443,6 +443,12 @@ const ROUNDING_MARGIN = 0.02;
 const REPEAT_SECONDS = 0.25;
 // drag streams glide note to note within this gap
 const GLIDE_SECONDS = 0.3;
+// a note this long before a rest ends a phrase
+const PHRASE_REST = 0.4;
+// a flick's swipe catches a tap or hold this close behind it (seconds, positionX units; the margin over
+// 3.5 covers the line moving between the two)
+const FLICK_CLEAR_SECONDS = 0.3;
+const FLICK_CLEAR_UNITS = 4;
 // a hand reaches at most this far past the middle of the screen
 const CENTER_REACH = 1.5;
 // a hand that played within this many seconds still has its finger down where it played
@@ -521,6 +527,8 @@ interface PlannedNote {
     chord: boolean;
     /** a chord of three */
     triple?: boolean;
+    /** type of the chord's other note (official chords mix types: drag with tap, flick with tap ...) */
+    partnerType?: OfficialNote['type'];
 }
 
 /** Takes the best `rate` share of `candidates` (by score, highest first) that pass `accept`. */
@@ -789,15 +797,27 @@ export const generateChart = (analysis: AudioAnalysis, options: GeneratorOptions
         sustain.push(...keptSustain);
     }
 
-    // flick (red): the hardest accents (sharpest jump in loudness), outside fast runs
+    // note types follow the way official charts use them (measured on 96 official IN/AT charts, levels 9-18):
+    // flicks (5-8% of notes) mark accents, mostly on the beat, and often close a phrase (14-35% of them
+    // are followed by a rest); a flick is followed nearby by another flick or a drag far more often than by
+    // a tap, which the flick's swipe would catch. drags (20-40%) come in sweeping runs of about five notes,
+    // sometimes ending in a flick. about half of all chords mix types: drag with tap or drag, a hold
+    // starting with a tap, a flick with a tap or another flick
+
+    // flick (red): the hardest accents (sharpest jump in loudness), outside fast runs, preferring the beat
+    // and the end of a phrase
     const quarterBeat = Math.max(1, sub / 4);
     const inRun = notes.map((_, i) => gapBefore(i) <= quarterBeat || gapAfter(i) <= quarterBeat);
-    const accent = (note: PlannedNote) => {
+    const restSlots = Math.round(PHRASE_REST / slotSeconds);
+    const accent = (i: number) => {
+        const note = notes[i];
         const onset = frameAt(slotTime(note.slot));
         const jump = valueAt(loudness, onset + 2) - valueAt(loudness, onset - 3);
-        return note.strength + 2 * Math.max(0, jump);
+        const phraseEnd = gapAfter(i) >= restSlots ? 1.5 : 0;
+        const onBeat = note.slot % sub === 0 ? 0.25 : 0;
+        return (note.strength + 2 * Math.max(0, jump)) * (1 + phraseEnd + onBeat);
     };
-    for (const i of takeTop(notes.map((_, i) => i), total, profile.flickRate * 0.6, i => accent(notes[i]),
+    for (const i of takeTop(notes.map((_, i) => i), total, profile.flickRate * 0.6, accent,
         i => notes[i].type === 1 && !inRun[i])) {
         notes[i].type = 4;
     }
@@ -817,22 +837,43 @@ export const generateChart = (analysis: AudioAnalysis, options: GeneratorOptions
     for (const i of takeTop(notes.map((_, i) => i), total, profile.dragRate, dragScore, i => notes[i].type === 1)) {
         notes[i].type = 2;
     }
-    // drags run in strings: a lone drag pulls in the light note after it, or goes back to a tap
+    // drags run in strings of about five: a drag pulls in the light, quick notes after it
+    const lightStrength = [...notes.map(n => n.strength)].sort((a, b) => a - b)[Math.floor(0.8 * (notes.length - 1))] ?? 0;
+    for (let i = 0; i + 1 < notes.length; i++) {
+        let length = 1;
+        while (length < i + 1 && notes[i - length]?.type === 2) length++;
+        const next = notes[i + 1];
+        if (notes[i].type === 2 && next.type === 1 && next.slot - notes[i].slot <= Math.max(1, (3 * sub) / 4)
+            && next.strength <= lightStrength && length < 8 && random() < 0.75) next.type = 2;
+    }
+    // a lone drag pulls in the light note after it, or goes back to a tap
     for (let i = 0; i < notes.length; i++) {
         if (notes[i].type !== 2 || notes[i - 1]?.type === 2 || notes[i + 1]?.type === 2) continue;
         const next = notes[i + 1];
         if (next && next.type === 1 && next.slot - notes[i].slot <= sub / 2) next.type = 2;
         else notes[i].type = 1;
     }
+    // a run of drags sometimes ends in a flick: the finger slides along, then swipes off
+    for (let i = 2; i + 1 < notes.length; i++) {
+        const next = notes[i + 1];
+        if (notes[i].type === 2 && notes[i - 1].type === 2 && notes[i - 2].type === 2 && next.type === 1
+            && next.slot - notes[i].slot <= sub / 2 && random() < 0.35) next.type = 4;
+    }
 
-    // chords on the strongest remaining taps
-    for (const i of takeTop(notes.map((_, i) => i), total, chordRate, i => notes[i].strength, i => notes[i].type === 1)) {
-        notes[i].chord = true;
+    // chords, shared between types as in official charts; the other note's type depends on this one's
+    const chordShare: [OfficialNote['type'], number][] = [[1, 0.55], [2, 0.25], [3, 0.12], [4, 0.08]];
+    for (const [type, share] of chordShare) {
+        for (const i of takeTop(notes.map((_, i) => i), total, chordRate * share, i => notes[i].strength, i => notes[i].type === type)) {
+            const note = notes[i];
+            note.chord = true;
+            const r = random();
+            note.partnerType = type === 1 ? (r < 0.2 ? 2 : 1) : type === 2 ? (r < 0.55 ? 2 : 1) : type === 3 ? 1 : r < 0.6 ? 1 : 4;
+        }
     }
     // with several fingers the strongest chords take a third note
     const tripleRate = style.triple[options.difficulty];
     if (tripleRate) {
-        for (const i of takeTop(notes.map((_, i) => i), total, tripleRate, i => notes[i].strength, i => notes[i].chord)) notes[i].triple = true;
+        for (const i of takeTop(notes.map((_, i) => i), total, tripleRate, i => notes[i].strength, i => notes[i].chord && notes[i].type === 1)) notes[i].triple = true;
     }
 
     const motion = options.lineMotion === false ? undefined : buildLineMotion(analysis, {
@@ -952,7 +993,7 @@ export const generateChart = (analysis: AudioAnalysis, options: GeneratorOptions
         // the same tone again from the same hand is a clean repeat on the same spot
         if (idle >= REPEAT_SECONDS && idle < 0.4 && hand.type !== 3 && Math.abs(note.pitch - hand.pitch) < SEMITONE / 2) x = hand.x;
         // drag strings glide from drag to drag instead of jumping
-        if (glides(h, note.type, time)) x = hand.x + clamp(x - hand.x, -1.2, 1.2);
+        if (glides(h, note.type, time)) x = hand.x + clamp(x - hand.x, -1.8, 1.8);
         return x;
     };
     const clearOf = (p: (typeof placed)[number], candidate: number, time: number) => {
@@ -973,6 +1014,10 @@ export const generateChart = (analysis: AudioAnalysis, options: GeneratorOptions
         }
         return null;
     };
+    /** taps and holds keep clear of a flick just before them, which its swipe would otherwise catch */
+    const clearOfFlicks = (type: OfficialNote['type'], candidate: number, time: number) => (type !== 1 && type !== 3)
+        || placed.every(p => p.type !== 4 || time - p.time <= 1e-6 || time - p.time >= FLICK_CLEAR_SECONDS
+            || Math.abs(p.x - candidate) >= FLICK_CLEAR_UNITS);
     const play = (h: number, x: number, time: number, end: number, type: OfficialNote['type'], pitch: number) => {
         const contacts = hands[h].contacts.filter(c => isHeld(c, time) || time - c.end < HAND_MEMORY);
         contacts.push({ x, time, end });
@@ -998,44 +1043,53 @@ export const generateChart = (analysis: AudioAnalysis, options: GeneratorOptions
             continue;
         }
 
-        let preferred: number;
         const step = (note.pitch - lastPitch) * 12;
-        if (lastHand < 0) preferred = pitchRank(note.pitch) >= 0.5 ? 1 : 0;
-        // streams go hand to hand; with several fingers a short stepwise run rolls across one hand
-        else if (time - lastTime < ALTERNATE_SECONDS) {
-            const roll = style.fingers > 1 && sameHandRun < style.fingers && random() < style.roll[options.difficulty];
-            preferred = roll ? lastHand : 1 - lastHand;
-        } else {
-            preferred = step >= 1 ? 1 : step <= -1 ? 0 : lastHand;
-            // keep both hands working
-            if (preferred === lastHand && sameHandRun >= 4) preferred = 1 - lastHand;
-        }
-        const order = playable.includes(preferred) ? [preferred, ...playable.filter(h => h !== preferred)] : playable;
-
-        let hand = -1;
-        let x = 0;
-        for (const h of order) {
-            const [low, high] = handRange(h, time, minX, maxX);
-            // the drag right before a gliding drag of the same hand is meant to be close
-            const gliding = glides(h, note.type, time);
-            const blocking = neighbours.filter(p => !(gliding && p.time === hands[h].time && p.type === 2));
-            // a spot one of the hand's fingers is still on (or has only just left) is that finger's, not another's
-            const taken = style.fingers > 1 ? busyFingers(h, note.type, time) : [];
-            const ok = (candidate: number) => blocking.every(p => clearOf(p, candidate, time))
-                && taken.every(c => Math.abs(c.x - candidate) >= NOTE_GAP + 0.01);
-            let spot = findSpot(melodicX(h, note, time), low, high, ok);
-            if (spot === null) continue;
-            if (profile.grid) {
-                const snapped = Math.round(spot / profile.grid) * profile.grid;
-                if (snapped >= low && snapped <= high && ok(snapped)) spot = snapped;
+        const preferHand = () => {
+            if (lastHand < 0) return pitchRank(note.pitch) >= 0.5 ? 1 : 0;
+            // a drag right after a drag continues the same finger's slide
+            if (glides(lastHand, note.type, time)) return lastHand;
+            // streams go hand to hand; with several fingers a short stepwise run rolls across one hand
+            if (time - lastTime < ALTERNATE_SECONDS) {
+                const roll = style.fingers > 1 && sameHandRun < style.fingers && random() < style.roll[options.difficulty];
+                return roll ? lastHand : 1 - lastHand;
             }
-            // a repeat lands exactly on the earlier note, not a hair beside it
-            const repeated = blocking.find(p => Math.abs(p.x - spot!) < 0.05);
-            if (repeated) spot = repeated.x;
-            hand = h;
-            x = spot;
-            break;
+            const byPitch = step >= 1 ? 1 : step <= -1 ? 0 : lastHand;
+            // keep both hands working
+            return byPitch === lastHand && sameHandRun >= 4 ? 1 - lastHand : byPitch;
+        };
+        const preferred = preferHand();
+        const search = (candidates: number[]): [number, number] | null => {
+            const order = candidates.includes(preferred) ? [preferred, ...candidates.filter(h => h !== preferred)] : candidates;
+            for (const h of order) {
+                const [low, high] = handRange(h, time, minX, maxX);
+                // the drag right before a gliding drag of the same hand is meant to be close
+                const gliding = glides(h, note.type, time);
+                const blocking = neighbours.filter(p => !(gliding && p.time === hands[h].time && p.type === 2));
+                // a spot one of the hand's fingers is still on (or has only just left) is that finger's, not another's
+                const taken = style.fingers > 1 ? busyFingers(h, note.type, time) : [];
+                const ok = (candidate: number) => blocking.every(p => clearOf(p, candidate, time))
+                    && taken.every(c => Math.abs(c.x - candidate) >= NOTE_GAP + 0.01)
+                    && clearOfFlicks(note.type, candidate, time);
+                let spot = findSpot(melodicX(h, note, time), low, high, ok);
+                if (spot === null) continue;
+                if (profile.grid) {
+                    const snapped = Math.round(spot / profile.grid) * profile.grid;
+                    if (snapped >= low && snapped <= high && ok(snapped)) spot = snapped;
+                }
+                // a repeat lands exactly on the earlier note, not a hair beside it
+                const repeated = blocking.find(p => Math.abs(p.x - spot!) < 0.05);
+                if (repeated) spot = repeated.x;
+                return [h, spot];
+            }
+            return null;
+        };
+        let found = search(playable);
+        // no clear spot for a tap behind a flick: it becomes a drag, which follows flicks in official charts
+        if (!found && note.type === 1) {
+            note.type = 2;
+            found = search([0, 1].filter(h => canPlay(h, 2, time)));
         }
+        const [hand, x] = found ?? [-1, 0];
         // no room for any finger: one note fewer is better than two on top of each other
         if (hand < 0) {
             dropped.add(note);
@@ -1049,21 +1103,23 @@ export const generateChart = (analysis: AudioAnalysis, options: GeneratorOptions
             // about 6 apart); with several fingers a hand can also take both notes, within its span
             let partner: number | null = null;
             let partnerHand = -1;
+            const partnerType = note.partnerType ?? note.type;
             const clearSpot = (h: number) => {
                 // as for any note, a spot a finger of that hand has only just left is that finger's
-                const taken = busyFingers(h, 1, time);
+                const taken = busyFingers(h, partnerType, time);
                 return (candidate: number) => neighbours.every(p => Math.abs(p.x - candidate) >= NOTE_GAP + 0.01)
                     && taken.every(c => Math.abs(c.x - candidate) >= NOTE_GAP + 0.01)
-                    && Math.abs(candidate - note.x) >= NOTE_GAP + 0.01;
+                    && Math.abs(candidate - note.x) >= NOTE_GAP + 0.01
+                    && clearOfFlicks(partnerType, candidate, time);
             };
             const other = 1 - hand;
-            if (canPlay(other, 1, time)) {
+            if (canPlay(other, partnerType, time)) {
                 const [minOther, maxOther] = handRange(other, time, minX, maxX);
                 const [low, high] = other === 1 ? [Math.max(minOther, note.x + 3.5), maxOther] : [minOther, Math.min(maxOther, note.x - 3.5)];
                 partner = findSpot(note.x + (other === 1 ? 1 : -1) * (4 + random() * 4), low, high, clearSpot(other));
                 partnerHand = other;
             }
-            if (partner === null && style.fingers > 1 && busyFingers(hand, 1, time).length + 1 < style.fingers) {
+            if (partner === null && style.fingers > 1 && busyFingers(hand, partnerType, time).length + 1 < style.fingers) {
                 const [low, high] = handRange(hand, time, minX, maxX);
                 const outward = hand === 1 ? 1 : -1;
                 const clear = clearSpot(hand);
@@ -1075,9 +1131,9 @@ export const generateChart = (analysis: AudioAnalysis, options: GeneratorOptions
                 note.chord = false;
             } else {
                 const px = Math.round(partner * 100) / 100;
-                chords.push({ ...note, x: px });
-                placed.push({ time, end: time, x: px, type: note.type });
-                play(partnerHand, px, time, time, note.type, note.pitch);
+                chords.push({ ...note, type: partnerType, holdSlots: 0, x: px });
+                placed.push({ time, end: time, x: px, type: partnerType });
+                play(partnerHand, px, time, time, partnerType, note.pitch);
             }
         }
 
@@ -1094,7 +1150,8 @@ export const generateChart = (analysis: AudioAnalysis, options: GeneratorOptions
                 const own = taken.filter(c => Math.abs(c.time - time) < 1e-6);
                 const anchor = own.length ? own[own.length - 1].x : hands[h].x;
                 const clear = (candidate: number) => [...neighbours, ...together].every(p => Math.abs(p.x - candidate) >= NOTE_GAP + 0.01)
-                    && taken.every(c => Math.abs(c.x - candidate) >= NOTE_GAP + 0.01);
+                    && taken.every(c => Math.abs(c.x - candidate) >= NOTE_GAP + 0.01)
+                    && clearOfFlicks(note.type, candidate, time);
                 const third = findSpot(anchor + (h === 1 ? 1 : -1) * 2.5, low, high, clear);
                 if (third === null) continue;
                 const tx = Math.round(third * 100) / 100;
