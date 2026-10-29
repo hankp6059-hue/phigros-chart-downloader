@@ -4,6 +4,7 @@
 
 import type { OfficialChart, OfficialNote } from './chartConverter';
 import { BASE_Y, LineMotion, LinePose, buildLineMotion } from './lineMotion';
+import { PLACEMENT_FEATURES, placementScore } from './placementModel';
 
 export type GeneratorDifficulty = 'EZ' | 'HD' | 'IN' | 'AT';
 
@@ -42,6 +43,8 @@ export interface GeneratorOptions {
     seed: string;
     /** animate the judgment line from the song's mood (default true) */
     lineMotion?: boolean;
+    /** pick note positions with the learned placement model rather than onset strength (default true) */
+    learnedPlacement?: boolean;
 }
 
 export interface GeneratedChart {
@@ -324,7 +327,8 @@ export const analyzeAudio = (channels: Float32Array[], sampleRate: number, tempo
 
 // ---------- generation ----------
 
-// targets are the medians of official Phigros charts per difficulty (notes per second, share of each key)
+// targets are the medians of official Phigros charts per difficulty (notes per second, share of each key);
+// densities were then scaled so generated note counts match official ones on 39 training songs
 interface DifficultyProfile {
     /** grid slots per beat */
     subdivision: number;
@@ -349,10 +353,10 @@ interface DifficultyProfile {
 }
 
 const PROFILES: Record<GeneratorDifficulty, DifficultyProfile> = {
-    EZ: { subdivision: 2, density: 2.2, minGap: 0.5, speed: 0.9, spread: 5.5, chordRate: 0.05, flickRate: 0.05, dragRate: 0.35, holdRate: 0.1, minHold: 1, grid: 0.5, alternate: 0.45 },
-    HD: { subdivision: 4, density: 4.3, minGap: 0.25, speed: 1.0, spread: 6, chordRate: 0.14, flickRate: 0.05, dragRate: 0.32, holdRate: 0.08, minHold: 1, grid: 0.5, alternate: 0.4 },
-    IN: { subdivision: 4, density: 6.7, minGap: 0.25, speed: 1.15, spread: 6.25, chordRate: 0.24, flickRate: 0.06, dragRate: 0.22, holdRate: 0.09, minHold: 0.5, grid: 0, alternate: 0.4 },
-    AT: { subdivision: 4, density: 9.6, minGap: 0.25, speed: 1.3, spread: 6.5, chordRate: 0.32, flickRate: 0.06, dragRate: 0.18, holdRate: 0.09, minHold: 0.5, grid: 0, alternate: 0.4 },
+    EZ: { subdivision: 2, density: 1.75, minGap: 0.5, speed: 0.9, spread: 5.5, chordRate: 0.05, flickRate: 0.05, dragRate: 0.35, holdRate: 0.1, minHold: 1, grid: 0.5, alternate: 0.45 },
+    HD: { subdivision: 4, density: 3.9, minGap: 0.25, speed: 1.0, spread: 6, chordRate: 0.14, flickRate: 0.05, dragRate: 0.32, holdRate: 0.08, minHold: 1, grid: 0.5, alternate: 0.4 },
+    IN: { subdivision: 4, density: 6.1, minGap: 0.25, speed: 1.15, spread: 6.25, chordRate: 0.24, flickRate: 0.06, dragRate: 0.22, holdRate: 0.09, minHold: 0.5, grid: 0, alternate: 0.4 },
+    AT: { subdivision: 4, density: 8.7, minGap: 0.25, speed: 1.3, spread: 6.5, chordRate: 0.32, flickRate: 0.06, dragRate: 0.18, holdRate: 0.09, minHold: 0.5, grid: 0, alternate: 0.4 },
 };
 
 // official charts span their constant events across the whole song with these bounds
@@ -369,11 +373,15 @@ const UNIT = 1350 / 18;
 // top of each other
 const NOTE_GAP = 2;
 const CLOSE_SECONDS = 0.4;
+// note times are rounded to 1/32 beat on export (up to ~8 ms on fast songs): checks keep this margin
+const ROUNDING_MARGIN = 0.02;
 const REPEAT_SECONDS = 0.25;
 // drag streams glide note to note within this gap
 const GLIDE_SECONDS = 0.3;
 const SILENCE = 0.04;
 const MIN_ONSET = 0.12;
+// below this placement probability a position is left empty however few notes there are
+const MIN_PLACEMENT = 0.1;
 const SEMITONE = 1 / 12;
 
 // least-squares fit of official difficulty constants on note features (516 official charts,
@@ -453,6 +461,78 @@ const takeTop = <T>(candidates: T[], total: number, rate: number, score: (c: T) 
     return chosen;
 };
 
+// ---------- note placement features (shared by model training and generation) ----------
+
+export const FEATURE_NAMES = [
+    'peak', 'envPeak', 'bassPeak', 'loud', 'section', 'low', 'bright', 'pitchMove', 'toneJump',
+    'beat', 'eighth', 'sixteenth', 'triplet', 'sixth', 'downbeat', 'prevBeatPeak', 'nextBeatPeak', 'localDensity', 'tempo',
+] as const;
+
+/** Musical features of a candidate note position, in the order of FEATURE_NAMES. */
+export const createFeatureExtractor = (analysis: AudioAnalysis, bpm: number, firstBeat: number) => {
+    const { envelope, bassEnvelope, loudness, lowLevel, brightness, pitch, tone, frameSeconds, frameOrigin } = analysis;
+    const beat = 60 / bpm;
+    const frameAt = (time: number) => Math.round((time - frameOrigin) / frameSeconds);
+    const valueAt = (values: Float32Array, frame: number) => values[Math.max(0, Math.min(values.length - 1, frame))];
+    const tolerance = Math.max(1, Math.round(0.025 / frameSeconds));
+    /** largest local maximum of a curve within the tolerance of `time` (0 when there is no onset) */
+    const peakNear = (values: Float32Array, time: number) => {
+        const center = frameAt(time);
+        let peak = 0;
+        for (let f = center - tolerance; f <= center + tolerance; f++) {
+            if (f < 1 || f + 1 >= values.length) continue;
+            if (values[f] >= values[f - 1] && values[f] >= values[f + 1]) peak = Math.max(peak, values[f]);
+        }
+        return peak;
+    };
+    const combinedPeak = (time: number) => Math.max(peakNear(envelope, time), peakNear(bassEnvelope, time));
+    const loudnessSum = new Float64Array(loudness.length + 1);
+    for (let f = 0; f < loudness.length; f++) loudnessSum[f + 1] = loudnessSum[f] + loudness[f];
+    const envelopeSum = new Float64Array(envelope.length + 1);
+    for (let f = 0; f < envelope.length; f++) envelopeSum[f + 1] = envelopeSum[f] + envelope[f];
+    const meanOver = (sum: Float64Array, from: number, to: number) => {
+        const a = Math.max(0, from);
+        const b = Math.min(sum.length - 1, to);
+        return b > a ? (sum[b] - sum[a]) / (b - a) : 0;
+    };
+    const sectionRadius = Math.max(1, Math.round((beat * 4) / frameSeconds));
+    let loudestSection = 1e-9;
+    for (let f = 0; f < loudness.length; f += sectionRadius) loudestSection = Math.max(loudestSection, meanOver(loudnessSum, f - sectionRadius, f + sectionRadius));
+    const brightnessMean = brightness.reduce((s, v) => s + v, 0) / Math.max(1, brightness.length);
+    const halfBeatFrames = Math.max(1, Math.round(beat / 2 / frameSeconds));
+    const near = (fraction: number, target: number) => Math.abs(fraction - target) * beat < 0.012;
+
+    return (time: number): number[] => {
+        const f = frameAt(time);
+        const beats = (time - firstBeat) / beat;
+        const fraction = ((beats % 1) + 1) % 1;
+        const onBeat = near(fraction, 0) || near(fraction, 1);
+        const pitchShift = Math.abs(valueAt(pitch, frameAt(time + 0.05)) - valueAt(pitch, frameAt(time - 0.05))) * 12;
+        const toneRatio = Math.log2((valueAt(tone, f + 2) + 1e-6) / (valueAt(tone, f - 3) + 1e-6));
+        return [
+            combinedPeak(time),
+            peakNear(envelope, time),
+            peakNear(bassEnvelope, time),
+            valueAt(loudness, f),
+            Math.min(1, meanOver(loudnessSum, f - sectionRadius, f + sectionRadius) / loudestSection),
+            valueAt(lowLevel, f),
+            valueAt(brightness, f) - brightnessMean,
+            Math.min(12, pitchShift) / 12,
+            Math.max(-3, Math.min(3, toneRatio)) / 3,
+            onBeat ? 1 : 0,
+            near(fraction, 0.5) ? 1 : 0,
+            near(fraction, 0.25) || near(fraction, 0.75) ? 1 : 0,
+            near(fraction, 1 / 3) || near(fraction, 2 / 3) ? 1 : 0,
+            near(fraction, 1 / 6) || near(fraction, 5 / 6) ? 1 : 0,
+            onBeat && ((Math.round(beats) % 4) + 4) % 4 === 0 ? 1 : 0,
+            combinedPeak(time - beat),
+            combinedPeak(time + beat),
+            meanOver(envelopeSum, f - halfBeatFrames, f + halfBeatFrames),
+            Math.log2(bpm / 160),
+        ];
+    };
+};
+
 /** Whether off-beat onsets fall on triplet positions more than on straight sixteenths. */
 const swingsInTriplets = (analysis: AudioAnalysis, bpm: number, firstBeat: number) => {
     const { envelope, frameSeconds, frameOrigin } = analysis;
@@ -501,6 +581,7 @@ export const generateChart = (analysis: AudioAnalysis, options: GeneratorOptions
     // onset strength near each slot, weighted by metric position so strong beats win ties
     const tolerance = Math.max(1, Math.round(0.035 / frameSeconds));
     const strengths = new Float32Array(slotCount);
+    const active = new Uint8Array(slotCount);
     let activeSlots = 0;
     for (let slot = 0; slot < slotCount; slot++) {
         const center = frameAt(slotTime(slot));
@@ -515,6 +596,7 @@ export const generateChart = (analysis: AudioAnalysis, options: GeneratorOptions
             loud = Math.max(loud, loudness[f]);
         }
         if (loud < SILENCE) continue;
+        active[slot] = 1;
         activeSlots++;
         const position = slot % sub;
         const metric = position === 0 ? 1 : position * 2 === sub ? 0.85 : (position * 3) % sub === 0 ? 0.8 : 0.7;
@@ -522,7 +604,15 @@ export const generateChart = (analysis: AudioAnalysis, options: GeneratorOptions
         strengths[slot] = peak * metric * (0.35 + 1.3 * section);
     }
 
-    // rhythm: greedily take the strongest onsets while respecting the minimum gap
+    // rhythm: where would an official charter put notes? the placement model (learned from 240 songs'
+    // official charts) scores every candidate position; take the best while respecting the minimum gap
+    const features = createFeatureExtractor(analysis, options.bpm, firstBeat);
+    const learned = options.learnedPlacement !== false && FEATURE_NAMES.every((name, i) => PLACEMENT_FEATURES[i] === name);
+    const scores = new Float32Array(slotCount);
+    for (let slot = 0; slot < slotCount; slot++) {
+        if (!active[slot]) continue;
+        scores[slot] = learned ? placementScore(options.difficulty, features(slotTime(slot))) : strengths[slot];
+    }
     // official note density grows with tempo (notes per second ∝ BPM^0.75 around a median of 175)
     let tempo = options.bpm;
     while (tempo < 115) tempo *= 2;
@@ -530,12 +620,12 @@ export const generateChart = (analysis: AudioAnalysis, options: GeneratorOptions
     const tempoFactor = Math.min(1.4, Math.max(0.6, (tempo / 175) ** 0.75));
     const target = Math.round((profile.density * tempoFactor * activeSlots * slotSeconds) / (1 + profile.chordRate));
     const gapSlots = Math.max(1, Math.round(profile.minGap * sub));
-    const order = Array.from({ length: slotCount }, (_, i) => i).sort((a, b) => strengths[b] - strengths[a]);
+    const order = Array.from({ length: slotCount }, (_, i) => i).sort((a, b) => scores[b] - scores[a]);
     const taken = new Uint8Array(slotCount);
     const picked: number[] = [];
     for (const slot of order) {
         // a quiet song gets fewer notes (and a lower rating) rather than notes on nothing
-        if (picked.length >= target || strengths[slot] < MIN_ONSET) break;
+        if (picked.length >= target || scores[slot] < (learned ? MIN_PLACEMENT : MIN_ONSET)) break;
         let free = true;
         for (let s = slot - gapSlots + 1; s < slot + gapSlots && free; s++) {
             if (s >= 0 && s < slotCount && taken[s]) free = false;
@@ -734,7 +824,7 @@ export const generateChart = (analysis: AudioAnalysis, options: GeneratorOptions
         const side = holding ? (holding.x === 0 ? 1 : -Math.sign(holding.x)) : 0;
         if (holding) note.chord = false;
 
-        const neighbours = placed.filter(p => time - p.time < CLOSE_SECONDS || p.end > time);
+        const neighbours = placed.filter(p => time - p.time < CLOSE_SECONDS + ROUNDING_MARGIN || p.end > time);
         // the drag right before a gliding drag is meant to be close
         const blocking = neighbours.filter(p => !(gliding && p.time === previous!.time && p.type === 2));
         const clearOf = (p: (typeof placed)[number], candidate: number) => {
@@ -821,7 +911,7 @@ export const generateChart = (analysis: AudioAnalysis, options: GeneratorOptions
         for (let k = kept.length - 1; k >= 0; k--) {
             const gap = time - slotTime(kept[k].slot);
             if (gap >= CLOSE_SECONDS + 4) break;
-            if (gap < CLOSE_SECONDS || endOf(kept[k]) > time) near.push(kept[k]);
+            if (gap < CLOSE_SECONDS + ROUNDING_MARGIN || endOf(kept[k]) > time) near.push(kept[k]);
         }
         const canRepeat = (other: PlannedNote) => other.type !== 3 && endOf(other) <= time
             && time - slotTime(other.slot) >= REPEAT_SECONDS - 0.001;
