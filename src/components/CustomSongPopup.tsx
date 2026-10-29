@@ -100,6 +100,7 @@ export const CustomSongPopup: React.FC<CustomSongPopupProps> = ({ isOpen, onClos
         }
     }, [latencyInput]);
     const [lineMotion, setLineMotion] = useState(true);
+    const [speedChanges, setSpeedChanges] = useState(true);
 
     useEffect(() => {
         if (!coverFile) {
@@ -154,8 +155,9 @@ export const CustomSongPopup: React.FC<CustomSongPopupProps> = ({ isOpen, onClos
             firstBeat: analysis.firstBeat + offsetMs / 1000,
             seed: `${name}|${audioFile?.size ?? 0}`,
             lineMotion,
+            speedChanges,
         })])) as Record<GeneratorDifficulty, ReturnType<typeof generateChart>>;
-    }, [analysis, bpmValid, bpm, offsetMs, name, audioFile, lineMotion]);
+    }, [analysis, bpmValid, bpm, offsetMs, name, audioFile, lineMotion, speedChanges]);
     const generated = charts?.[difficulty] ?? null;
 
     const level = levelOverride ?? (generated ? String(generated.level) : '');
@@ -298,6 +300,9 @@ export const CustomSongPopup: React.FC<CustomSongPopupProps> = ({ isOpen, onClos
                             <span className="text-[#fde047]">Drag {generated.stats.drag}</span>
                             <span className="text-[#f87171]">Flick {generated.stats.flick}</span>
                             <span className="text-[#c4b5fd]">Hold {generated.stats.hold}</span>
+                            <span className="text-slate-400" title="谱面流速（官方单位），随歌曲段落变化">
+                                流速 {generated.speed.min === generated.speed.max ? generated.speed.min.toFixed(2) : `${generated.speed.min.toFixed(2)}–${generated.speed.max.toFixed(2)}`}
+                            </span>
                         </div>
                         <Button variant="outline" onClick={() => setShowPreview(v => !v)}>{showPreview ? '收起预览' : '预览谱面'}</Button>
                     </div>
@@ -308,6 +313,10 @@ export const CustomSongPopup: React.FC<CustomSongPopupProps> = ({ isOpen, onClos
                         <label className="flex items-center gap-2 text-[13px] text-slate-300">
                             <input type="checkbox" checked={lineMotion} onChange={e => setLineMotion(e.target.checked)} className="accent-[#22d3ee]" />
                             判定线随歌曲情绪运动
+                        </label>
+                        <label className="flex items-center gap-2 text-[13px] text-slate-300">
+                            <input type="checkbox" checked={speedChanges} onChange={e => setSpeedChanges(e.target.checked)} className="accent-[#22d3ee]" />
+                            流速随音乐变化（平缓处放慢，铺垫逐拍加速，爆发与高潮提速）
                         </label>
                         {generated?.motion && (
                             <>
@@ -336,8 +345,10 @@ export const CustomSongPopup: React.FC<CustomSongPopupProps> = ({ isOpen, onClos
                 )}
 
                 <p className="text-[12px] leading-[1.6] text-slate-500 text-pretty">
-                    音符放在哪里，由一个从 240 首官方谱面（曲库的 73%）里学到的模型决定，模仿谱师的取舍；左右位置跟随音高（低音在左、高音在右），音符之间不会重叠。最强的重音是红色 Flick，轻打和快速连音是黄色 Drag，
-                    持续的长音是 Hold，其余是蓝色 Tap。判定线按每小节的情绪运动：平缓处呼吸、律动处摇摆、铺垫时蓄力倾斜、爆发时回正下砸，
+                    音符放在哪里，由一个从 240 首官方谱面（曲库的 73%）里学到的模型决定，模仿谱师的取舍。键位按官方谱面的双手（双拇指）习惯来排：左手负责左半屏、右手负责右半屏，两手永不交叉；
+                    快于单手连打的音符左右交互，慢一些时旋律上行交给右手、下行交给左手，每只手顺着旋律从上一个位置移动，移动距离不超过手指在这段时间里能到达的范围；
+                    双押一手一个，Hold 由一只手按住时其余音符全部交给另一只手，音符之间不会重叠。最强的重音是红色 Flick，轻打和快速连音是黄色 Drag，
+                    持续的长音是 Hold，其余是蓝色 Tap。流速跟着段落走：平缓、静默段放慢，铺垫段逐拍加速，爆发和高潮段提速（EZ 变化更小）。判定线按每小节的情绪运动：平缓处呼吸、律动处摇摆、铺垫时蓄力倾斜、爆发时回正下砸，
                     高潮的动法由歌曲本身的明亮度、密度和旋律起伏混合而成。物量和各种键的比例参照官方同难度谱面的中位数；定数由官方 516 张谱面拟合的公式自动评出（平均误差约 ±1）。
                     如果试听时打击音和节拍对不上，请修改 BPM 或偏移（正数让音符更晚出现）。导出格式与原程序一致，遵循设置里的「ZIP 格式」和「谱面格式转换」选项。
                 </p>

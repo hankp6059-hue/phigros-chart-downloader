@@ -31,6 +31,8 @@ interface OfficialSpeedEvent {
     startTime: number;
     endTime: number;
     value: number;
+    /** distance travelled by the start of the event (formatVersion 3) */
+    floorPosition?: number;
 }
 
 export interface OfficialLine {

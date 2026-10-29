@@ -45,6 +45,27 @@ export interface ScreenPose {
 
 export const secondsPerUnit = (line: Line) => 1.875 / line.bpm;
 
+/** Distance the line's notes have travelled by `seconds`, summed over its speed events. */
+export const createFloorAt = (line: Line) => {
+    const spu = secondsPerUnit(line);
+    const events = [...line.speedEvents].sort((a, b) => a.startTime - b.startTime);
+    const starts: number[] = [];
+    const floors: number[] = [];
+    let floor = 0;
+    for (let i = 0; i < events.length; i++) {
+        const start = Math.max(0, events[i].startTime) * spu;
+        if (i > 0) floor += (start - starts[i - 1]) * events[i - 1].value;
+        starts.push(start);
+        floors.push(floor);
+    }
+    return (seconds: number) => {
+        if (!events.length) return seconds;
+        let i = events.length - 1;
+        while (i > 0 && starts[i] > seconds) i--;
+        return floors[i] + (seconds - starts[i]) * events[i].value;
+    };
+};
+
 export const linePoseAt = (line: Line, seconds: number, width: number, height: number): ScreenPose => {
     const time = seconds / secondsPerUnit(line);
     return {
@@ -76,7 +97,7 @@ export interface RenderOptions {
 export const renderChart = (g: CanvasRenderingContext2D, chart: OfficialChart, seconds: number, width: number, height: number, options: RenderOptions = {}) => {
     const line = chart.judgeLineList[0];
     const spu = secondsPerUnit(line);
-    const speed = line.speedEvents[0]?.value ?? 1;
+    const floorAt = createFloorAt(line);
 
     g.fillStyle = '#05070a';
     g.fillRect(0, 0, width, height);
@@ -93,7 +114,7 @@ export const renderChart = (g: CanvasRenderingContext2D, chart: OfficialChart, s
 
     const pose = linePoseAt(line, seconds, width, height);
     const { unit, noteWidth, noteHeight, floorScale } = noteMetrics(width, height);
-    const currentFloor = seconds * speed;
+    const currentFloor = floorAt(seconds);
 
     g.save();
     g.translate(pose.x, pose.y);
@@ -126,7 +147,7 @@ export const renderChart = (g: CanvasRenderingContext2D, chart: OfficialChart, s
             if (seconds > endSeconds) continue;
             const holding = options.isHolding?.(i) ?? seconds >= hitSeconds;
             const head = holding ? Math.max(0, (note.floorPosition - currentFloor) * floorScale) : (note.floorPosition - currentFloor) * floorScale;
-            const tail = (note.floorPosition + (endSeconds - hitSeconds) * note.speed - currentFloor) * floorScale;
+            const tail = (floorAt(endSeconds) - currentFloor) * floorScale;
             if (head > height * 2) continue;
             g.fillStyle = holding ? 'rgba(10,195,255,0.75)' : 'rgba(10,195,255,0.5)';
             g.fillRect(lx - noteWidth * 0.4, -tail, noteWidth * 0.8, tail - head);

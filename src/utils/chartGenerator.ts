@@ -3,7 +3,8 @@
 // and emits an official-format chart so it goes through the same export pipeline as game charts.
 
 import type { OfficialChart, OfficialNote } from './chartConverter';
-import { BASE_Y, LineMotion, LinePose, buildLineMotion } from './lineMotion';
+import { BASE_Y, LineMotion, LinePose, buildLineMotion, readBarMoods } from './lineMotion';
+import { SpeedChange, buildScrollSpeed } from './scrollSpeed';
 import { PLACEMENT_FEATURES, placementScore } from './placementModel';
 
 export type GeneratorDifficulty = 'EZ' | 'HD' | 'IN' | 'AT';
@@ -45,6 +46,8 @@ export interface GeneratorOptions {
     lineMotion?: boolean;
     /** pick note positions with the learned placement model rather than onset strength (default true) */
     learnedPlacement?: boolean;
+    /** change the scroll speed with the music (default true) */
+    speedChanges?: boolean;
 }
 
 export interface GeneratedChart {
@@ -53,6 +56,8 @@ export interface GeneratedChart {
     motion?: LineMotion;
     /** difficulty constant on the official scale */
     level: number;
+    /** scroll speed over the song (official units) */
+    speed: { min: number; max: number; changes: SpeedChange[] };
     stats: { total: number; tap: number; drag: number; hold: number; flick: number };
 }
 
@@ -348,15 +353,17 @@ interface DifficultyProfile {
     minHold: number;
     /** positions snap to this step (0 = free) */
     grid: number;
-    /** chance that a quick note on the same side as the last one switches hands */
-    alternate: number;
+    /** shortest time between two taps of the same hand, in seconds; anything quicker is played hand to hand */
+    sameHand: number;
+    /** how far a hand travels across the screen per second, in positionX units */
+    handSpeed: number;
 }
 
 const PROFILES: Record<GeneratorDifficulty, DifficultyProfile> = {
-    EZ: { subdivision: 2, density: 1.75, minGap: 0.5, speed: 0.9, spread: 5.5, chordRate: 0.05, flickRate: 0.05, dragRate: 0.35, holdRate: 0.1, minHold: 1, grid: 0.5, alternate: 0.45 },
-    HD: { subdivision: 4, density: 3.9, minGap: 0.25, speed: 1.0, spread: 6, chordRate: 0.14, flickRate: 0.05, dragRate: 0.32, holdRate: 0.08, minHold: 1, grid: 0.5, alternate: 0.4 },
-    IN: { subdivision: 4, density: 6.1, minGap: 0.25, speed: 1.15, spread: 6.25, chordRate: 0.24, flickRate: 0.06, dragRate: 0.22, holdRate: 0.09, minHold: 0.5, grid: 0, alternate: 0.4 },
-    AT: { subdivision: 4, density: 8.7, minGap: 0.25, speed: 1.3, spread: 6.5, chordRate: 0.32, flickRate: 0.06, dragRate: 0.18, holdRate: 0.09, minHold: 0.5, grid: 0, alternate: 0.4 },
+    EZ: { subdivision: 2, density: 1.75, minGap: 0.5, speed: 0.9, spread: 5.5, chordRate: 0.05, flickRate: 0.05, dragRate: 0.35, holdRate: 0.1, minHold: 1, grid: 0.5, sameHand: 0.4, handSpeed: 9 },
+    HD: { subdivision: 4, density: 3.9, minGap: 0.25, speed: 1.0, spread: 6, chordRate: 0.14, flickRate: 0.05, dragRate: 0.32, holdRate: 0.08, minHold: 1, grid: 0.5, sameHand: 0.22, handSpeed: 13 },
+    IN: { subdivision: 4, density: 6.1, minGap: 0.25, speed: 1.15, spread: 6.25, chordRate: 0.24, flickRate: 0.06, dragRate: 0.22, holdRate: 0.09, minHold: 0.5, grid: 0, sameHand: 0.15, handSpeed: 17 },
+    AT: { subdivision: 4, density: 8.7, minGap: 0.25, speed: 1.3, spread: 6.5, chordRate: 0.32, flickRate: 0.06, dragRate: 0.18, holdRate: 0.09, minHold: 0.5, grid: 0, sameHand: 0.12, handSpeed: 21 },
 };
 
 // official charts span their constant events across the whole song with these bounds
@@ -378,6 +385,12 @@ const ROUNDING_MARGIN = 0.02;
 const REPEAT_SECONDS = 0.25;
 // drag streams glide note to note within this gap
 const GLIDE_SECONDS = 0.3;
+// a hand reaches at most this far past the middle of the screen
+const CENTER_REACH = 1.5;
+// a hand that played within this many seconds still has its finger down where it played
+const HAND_MEMORY = 0.8;
+// notes closer than this go hand to hand even when one hand could play both
+const ALTERNATE_SECONDS = 0.3;
 const SILENCE = 0.04;
 const MIN_ONSET = 0.12;
 // below this placement probability a position is left empty however few notes there are
@@ -783,9 +796,13 @@ export const generateChart = (analysis: AudioAnalysis, options: GeneratorOptions
         return [Math.max(low, -profile.spread), Math.min(high, profile.spread)];
     };
 
-    // position follows pitch (low notes on the left, high on the right), but no note may come within
-    // NOTE_GAP of a note that is still close in time, or of a hold that is still being held
-    // by pitch rank, so the notes spread over the playfield however narrow the melody is
+    // fingering, the way official charts are written for two hands (thumbs or index fingers): the left
+    // hand plays the left half of the screen, the right hand the right half, and they never cross.
+    // notes quicker than one hand can tap go hand to hand; otherwise a rising melody moves to the right
+    // hand and a falling one to the left. each hand follows the melody from where it last played, only
+    // as far as it can travel in the time it has. a chord takes one note per hand, and while one hand
+    // holds, the other plays everything else on its own side
+    // pitch by rank, so the notes spread over the playfield however narrow the melody is
     const pitches = notes.map(n => n.pitch).sort((a, b) => a - b);
     const pitchRank = (value: number) => {
         let lo = 0;
@@ -800,105 +817,196 @@ export const generateChart = (analysis: AudioAnalysis, options: GeneratorOptions
     const placed: { time: number; end: number; x: number; type: OfficialNote['type'] }[] = [];
     const chords: PlannedNote[] = [];
     const dropped = new Set<PlannedNote>();
-    let previous: { time: number; x: number; type: OfficialNote['type']; pitch: number } | null = null;
-    let hold: { end: number; x: number } | null = null;
+    interface Hand { x: number; time: number; end: number; type: OfficialNote['type']; pitch: number }
+    const hands: Hand[] = [
+        { x: -profile.spread / 2, time: -Infinity, end: -Infinity, type: 1, pitch: NaN },
+        { x: profile.spread / 2, time: -Infinity, end: -Infinity, type: 1, pitch: NaN },
+    ];
+    let lastHand = -1;
+    let lastTime = -Infinity;
+    let lastPitch = NaN;
+    let sameHandRun = 0;
+    const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v));
+
+    const holdingAt = (h: number, time: number) => hands[h].end > time + 1e-6;
+    /** whether hand `h` can play a note of this type at `time` */
+    const canPlay = (h: number, type: OfficialNote['type'], time: number) => {
+        const hand = hands[h];
+        if (holdingAt(h, time)) return false;
+        // a drag string glides under one finger
+        if (type === 2 && hand.type === 2 && time - hand.time < GLIDE_SECONDS) return true;
+        return time - Math.max(hand.time, hand.end) >= profile.sameHand * (type === 4 ? 1.3 : 1) - 1e-6;
+    };
+    /** seconds since hand `h` last played (or let go of a hold) */
+    const idleFor = (h: number, time: number) => time - Math.max(hands[h].time, hands[h].end);
+    /** where hand `h` may play at `time`: its half of the screen, clear of the other hand while that one is in play, within reach */
+    const handRange = (h: number, time: number, minX: number, maxX: number): [number, number] => {
+        const other = hands[1 - h];
+        let low = h === 0 ? minX : Math.max(minX, -CENTER_REACH);
+        let high = h === 0 ? Math.min(maxX, CENTER_REACH) : maxX;
+        if (holdingAt(1 - h, time) || time - other.time < HAND_MEMORY) {
+            if (h === 0) high = Math.min(high, other.x - NOTE_GAP - 0.01);
+            else low = Math.max(low, other.x + NOTE_GAP + 0.01);
+        }
+        const idle = idleFor(h, time);
+        if (Number.isFinite(idle)) {
+            const reach = 1.5 + profile.handSpeed * Math.min(1, idle);
+            low = Math.max(low, hands[h].x - reach);
+            high = Math.min(high, hands[h].x + reach);
+        }
+        return [low, high];
+    };
+    /** where the melody puts a note for hand `h`: by pitch inside the hand's half, moved by the step from its last note */
+    const melodicX = (h: number, note: PlannedNote, time: number) => {
+        const [from, to] = h === 0 ? [-profile.spread, -1] : [1, profile.spread];
+        let x = from + (to - from) * Math.min(1, pitchRank(note.pitch));
+        const hand = hands[h];
+        const idle = idleFor(h, time);
+        if (idle < 1.5 && Number.isFinite(hand.pitch)) x = 0.5 * x + 0.5 * (hand.x + clamp((note.pitch - hand.pitch) * 6, -3, 3));
+        // the same tone again from the same hand is a clean repeat on the same spot
+        if (idle >= REPEAT_SECONDS && idle < 0.4 && hand.type !== 3 && Math.abs(note.pitch - hand.pitch) < SEMITONE / 2) x = hand.x;
+        // drag strings glide from drag to drag instead of jumping
+        if (note.type === 2 && hand.type === 2 && time - hand.time < GLIDE_SECONDS) x = hand.x + clamp(x - hand.x, -1.2, 1.2);
+        return x;
+    };
+    const clearOf = (p: (typeof placed)[number], candidate: number, time: number) => {
+        const dx = Math.abs(p.x - candidate);
+        // positions are rounded to 0.01 afterwards, which must not bring them under NOTE_GAP
+        if (dx >= NOTE_GAP + 0.01) return true;
+        // a clean repeat: same spot, far enough apart in time, and not on a hold still being held
+        return dx < 0.05 && p.type !== 3 && p.end <= time && time - p.time >= REPEAT_SECONDS;
+    };
+    /** nearest free spot to `wanted` inside [low, high], or null */
+    const findSpot = (wanted: number, low: number, high: number, ok: (x: number) => boolean) => {
+        const start = clamp(wanted, low, high);
+        if (low <= high && ok(start)) return start;
+        for (let step = 1; step <= 80; step++) {
+            for (const candidate of [start + step * 0.25, start - step * 0.25]) {
+                if (candidate >= low && candidate <= high && ok(candidate)) return candidate;
+            }
+        }
+        return null;
+    };
 
     for (const note of notes) {
         const time = slotTime(note.slot);
         const [minX, maxX] = reachAt(time);
-        let x = (Math.min(1, pitchRank(note.pitch)) * 2 - 1) * profile.spread;
-
-        // drag streams glide from drag to drag instead of jumping
-        const gliding = note.type === 2 && previous?.type === 2 && time - previous.time < GLIDE_SECONDS;
-        if (gliding) x = previous!.x + Math.max(-1.2, Math.min(1.2, x - previous!.x));
-        // quick notes often switch hands
-        // the same note again sits where it was (a repeat), otherwise quick notes often switch hands
-        else if (previous && time - previous.time >= REPEAT_SECONDS && time - previous.time < 0.4
-            && previous.type !== 3 && Math.abs(note.pitch - previous.pitch) < SEMITONE / 2) x = previous.x;
-        else if (previous && time - previous.time < 0.4 && Math.sign(x) === Math.sign(previous.x) && random() < profile.alternate) {
-            x = -Math.sign(previous.x || 1) * Math.max(1.5, Math.abs(x));
-        }
-
-        // during a hold the other hand plays, on the other side of the screen
-        const holding = hold && note.slot < hold.end ? hold : null;
-        const side = holding ? (holding.x === 0 ? 1 : -Math.sign(holding.x)) : 0;
-        if (holding) note.chord = false;
-
         const neighbours = placed.filter(p => time - p.time < CLOSE_SECONDS + ROUNDING_MARGIN || p.end > time);
-        // the drag right before a gliding drag is meant to be close
-        const blocking = neighbours.filter(p => !(gliding && p.time === previous!.time && p.type === 2));
-        const clearOf = (p: (typeof placed)[number], candidate: number) => {
-            const dx = Math.abs(p.x - candidate);
-            // positions are rounded to 0.01 afterwards, which must not bring them under NOTE_GAP
-            if (dx >= NOTE_GAP + 0.01) return true;
-            // a clean repeat: same spot, far enough apart in time, and not on a hold still being held
-            return dx < 0.05 && p.type !== 3 && p.end <= time && time - p.time >= REPEAT_SECONDS;
-        };
-        const fits = (candidate: number) => candidate >= minX && candidate <= maxX
-            && (!side || (Math.sign(candidate) === side && Math.abs(candidate) >= NOTE_GAP))
-            && blocking.every(p => clearOf(p, candidate));
-        x = Math.min(maxX, Math.max(minX, x));
-        if (!fits(x)) {
-            // nearest free spot, alternating sides
-            let found: number | null = null;
-            for (let step = 1; step <= 80 && found === null; step++) {
-                for (const candidate of [x + step * 0.25, x - step * 0.25]) {
-                    if (fits(candidate)) {
-                        found = candidate;
-                        break;
-                    }
-                }
+
+        let playable = [0, 1].filter(h => canPlay(h, note.type, time));
+        // too quick for either hand: a light hit becomes a drag the free finger just slides onto
+        if (!playable.length && note.type !== 3) {
+            const free = [0, 1].filter(h => !holdingAt(h, time) && idleFor(h, time) >= 0.06);
+            if (free.length) {
+                note.type = 2;
+                playable = free;
             }
-            // no room anywhere: one note fewer is better than two on top of each other
-            if (found === null) {
-                dropped.add(note);
-                continue;
+        }
+        if (!playable.length) {
+            dropped.add(note);
+            continue;
+        }
+
+        let preferred: number;
+        if (lastHand < 0) preferred = pitchRank(note.pitch) >= 0.5 ? 1 : 0;
+        // streams go hand to hand
+        else if (time - lastTime < ALTERNATE_SECONDS) preferred = 1 - lastHand;
+        else {
+            const step = (note.pitch - lastPitch) * 12;
+            preferred = step >= 1 ? 1 : step <= -1 ? 0 : lastHand;
+            // keep both hands working
+            if (preferred === lastHand && sameHandRun >= 4) preferred = 1 - lastHand;
+        }
+        const order = playable.includes(preferred) ? [preferred, ...playable.filter(h => h !== preferred)] : playable;
+
+        // a chord needs both hands free
+        if (note.chord && !(canPlay(0, 1, time) && canPlay(1, 1, time))) note.chord = false;
+
+        let hand = -1;
+        let x = 0;
+        for (const h of order) {
+            const [low, high] = handRange(h, time, minX, maxX);
+            // the drag right before a gliding drag of the same hand is meant to be close
+            const gliding = note.type === 2 && hands[h].type === 2 && time - hands[h].time < GLIDE_SECONDS;
+            const blocking = neighbours.filter(p => !(gliding && p.time === hands[h].time && p.type === 2));
+            const ok = (candidate: number) => blocking.every(p => clearOf(p, candidate, time));
+            let spot = findSpot(melodicX(h, note, time), low, high, ok);
+            if (spot === null) continue;
+            if (profile.grid) {
+                const snapped = Math.round(spot / profile.grid) * profile.grid;
+                if (snapped >= low && snapped <= high && ok(snapped)) spot = snapped;
             }
-            x = found;
+            // a repeat lands exactly on the earlier note, not a hair beside it
+            const repeated = blocking.find(p => Math.abs(p.x - spot!) < 0.05);
+            if (repeated) spot = repeated.x;
+            hand = h;
+            x = spot;
+            break;
         }
-        if (profile.grid) {
-            const snapped = Math.round(x / profile.grid) * profile.grid;
-            if (fits(snapped) || !fits(x)) x = snapped;
+        // no room for either hand: one note fewer is better than two on top of each other
+        if (hand < 0) {
+            dropped.add(note);
+            continue;
         }
-        // a repeat lands exactly on the earlier note, not a hair beside it
-        const repeated = blocking.find(p => Math.abs(p.x - x) < 0.05);
-        if (repeated) x = repeated.x;
         note.x = Math.round(x * 100) / 100;
 
         if (note.chord) {
-            // the partner mirrors the note and must be clear of everything around it too
-            const [partnerMin, partnerMax] = [minX, maxX];
-            const clear = (candidate: number) => candidate >= partnerMin && candidate <= partnerMax
-                && Math.abs(candidate - note.x) >= 3.5
-                && blocking.every(p => Math.abs(p.x - candidate) >= NOTE_GAP + 0.01);
-            // official chords sit about 6 units apart
-            const wanted = note.x - Math.sign(note.x || 1) * (4 + random() * 4);
-            let partner: number | null = clear(wanted) ? wanted : null;
-            for (let step = 1; step <= 40 && partner === null; step++) {
-                for (const candidate of [wanted + step * 0.25, wanted - step * 0.25]) {
-                    if (clear(candidate)) {
-                        partner = candidate;
-                        break;
-                    }
-                }
-            }
+            // the other hand takes the partner, on its own side, about 4-8 units away (official chords sit
+            // about 6 apart), as far as it can reach from where it last played
+            const other = 1 - hand;
+            const [minOther, maxOther] = handRange(other, time, minX, maxX);
+            const [low, high] = other === 1 ? [Math.max(minOther, note.x + 3.5), maxOther] : [minOther, Math.min(maxOther, note.x - 3.5)];
+            const wanted = note.x + (other === 1 ? 1 : -1) * (4 + random() * 4);
+            const partner = findSpot(wanted, low, high, candidate => neighbours.every(p => Math.abs(p.x - candidate) >= NOTE_GAP + 0.01));
             if (partner === null) {
                 note.chord = false;
             } else {
-                chords.push({ ...note, x: Math.round(partner * 100) / 100 });
-                placed.push({ time, end: time, x: Math.round(partner * 100) / 100, type: note.type });
+                const px = Math.round(partner * 100) / 100;
+                chords.push({ ...note, x: px });
+                placed.push({ time, end: time, x: px, type: note.type });
+                hands[other] = { x: px, time, end: time, type: note.type, pitch: note.pitch };
             }
         }
 
         const end = note.type === 3 ? slotTime(note.slot + note.holdSlots) : time;
         placed.push({ time, end, x: note.x, type: note.type });
-        previous = { time, x: note.x, type: note.type, pitch: note.pitch };
-        if (note.type === 3) hold = { end: note.slot + note.holdSlots, x: note.x };
+        hands[hand] = { x: note.x, time, end, type: note.type, pitch: note.pitch };
+        sameHandRun = hand === lastHand ? sameHandRun + 1 : 1;
+        lastHand = hand;
+        lastTime = time;
+        lastPitch = note.pitch;
     }
 
     // to official format. time unit is 1/32 beat; floorPosition is distance travelled at the line speed
     const toTime = (seconds: number) => Math.round((seconds * options.bpm) / 1.875);
     const toSeconds = (time: number) => (time * 1.875) / options.bpm;
+
+    // scroll speed: steps on official time units, and the distance travelled (floor position) summed
+    // over them exactly as players do, so notes reach the line on time whatever the speed
+    const speedChanges = options.speedChanges === false
+        ? [{ time: 0, value: profile.speed }]
+        : buildScrollSpeed(motion?.bars ?? readBarMoods(analysis, options.bpm, firstBeat), { difficulty: options.difficulty, bpm: options.bpm, base: profile.speed });
+    const speedSteps: { time: number; value: number; floor: number }[] = [];
+    for (const change of speedChanges) {
+        const time = Math.max(0, toTime(change.time));
+        const last = speedSteps[speedSteps.length - 1];
+        if (last && time <= last.time) last.value = change.value;
+        else speedSteps.push({ time, value: change.value, floor: 0 });
+    }
+    for (let i = 1; i < speedSteps.length; i++) {
+        const prev = speedSteps[i - 1];
+        speedSteps[i].floor = prev.floor + toSeconds(speedSteps[i].time - prev.time) * prev.value;
+    }
+    const stepAt = (time: number) => {
+        let i = speedSteps.length - 1;
+        while (i > 0 && speedSteps[i].time > time) i--;
+        return speedSteps[i];
+    };
+    const speedAt = (time: number) => stepAt(time).value;
+    const floorAt = (time: number) => {
+        const step = stepAt(time);
+        return step.floor + toSeconds(time - step.time) * step.value;
+    };
     // final guarantee for the player: within CLOSE_SECONDS two notes are a clean repeat or NOTE_GAP
     // apart (drag streams aside). a note off by a hair snaps onto the earlier one, anything else goes
     const final = [...notes.filter(n => !dropped.has(n)), ...chords].sort((a, b) => a.slot - b.slot);
@@ -934,8 +1042,8 @@ export const generateChart = (analysis: AudioAnalysis, options: GeneratorOptions
                 holdTime,
                 positionX: note.x,
                 // hold speed is absolute, other notes are relative to the line
-                speed: note.type === 3 ? profile.speed : 1,
-                floorPosition: toSeconds(time) * profile.speed,
+                speed: note.type === 3 ? speedAt(time) : 1,
+                floorPosition: floorAt(time),
             };
         })
         .sort((a, b) => a.time - b.time);
@@ -983,7 +1091,12 @@ export const generateChart = (analysis: AudioAnalysis, options: GeneratorOptions
             judgeLineMoveEvents: moveEvents,
             judgeLineRotateEvents: rotateEvents,
             judgeLineDisappearEvents: alphaEvents,
-            speedEvents: [{ startTime: 0, endTime: EVENT_END, value: profile.speed }],
+            speedEvents: speedSteps.map((step, i) => ({
+                startTime: step.time,
+                endTime: speedSteps[i + 1]?.time ?? EVENT_END,
+                value: step.value,
+                floorPosition: step.floor,
+            })),
             notesAbove: officialNotes,
             notesBelow: [],
         }],
@@ -994,6 +1107,11 @@ export const generateChart = (analysis: AudioAnalysis, options: GeneratorOptions
         chart,
         motion,
         level: Math.round(Math.min(16.9, rateNotes(officialNotes.map(n => ({ time: toSeconds(n.time), type: n.type }))) + LEVEL_CALIBRATION[options.difficulty]) * 10) / 10,
+        speed: {
+            min: Math.min(...speedSteps.map(step => step.value)),
+            max: Math.max(...speedSteps.map(step => step.value)),
+            changes: speedSteps.map(step => ({ time: toSeconds(step.time), value: step.value })),
+        },
         stats: { total: officialNotes.length, tap: count(1), drag: count(2), hold: count(3), flick: count(4) },
     };
 };
