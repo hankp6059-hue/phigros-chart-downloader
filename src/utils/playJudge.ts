@@ -1,20 +1,31 @@
-// judgment for playing a single-line chart by touch. positions are in positionX units along the
-// judgment line (the caller projects each finger onto the line every frame, since the line moves).
-//   tap / hold head: press near the note within the timing window
-//   drag:  any finger resting near the note as it arrives
-//   flick: a finger swiping near the note within the timing window
-//   hold:  keep a finger near it until (almost) the end
+// judgment for playing a single-line chart by touch, ported from Phira's judge
+// (https://github.com/TeamFlos/phira/blob/main/prpr/src/judge.rs) so a chart plays here as it will there.
+// positions are in positionX units along the judgment line (the caller projects each finger onto the
+// line every frame, since the line moves).
+//   touch down: hits the best-matching note by timing and distance; a tap is Perfect / Good / Bad,
+//               a hold starts; a drag or flick that matches best takes the touch without being hit
+//   swipe:      hits the best-matching flick (a drag that matches best takes it instead)
+//   drag:       any finger near the note within the window; counts once its time comes
+//   hold:       keep a finger near it; safe once its end is within BAD_WINDOW
+//   anything still unhit BAD_WINDOW after its time is a Miss
 
 import type { OfficialChart, OfficialNote } from './chartConverter';
 
-export const PERFECT_WINDOW = 0.07;
-export const GOOD_WINDOW = 0.15;
-/** how far from a note's centre a finger still counts, in positionX units (a note is 1.8 wide) */
-export const REACH = 1.5;
-/** a hold may be let go this long before its end */
-const HOLD_RELEASE_GRACE = 0.12;
+export const PERFECT_WINDOW = 0.08;
+export const GOOD_WINDOW = 0.16;
+export const BAD_WINDOW = 0.22;
+/** a touch this much late still counts as on time (Phira's EARLY_OFFSET) */
+const LATE_ALLOWANCE = 0.07;
+/** how far from a note's centre a finger still counts, in positionX units (Phira: 0.21 / (16/9) * 2 of half the screen) */
+export const REACH = 2.1;
+/** note width in positionX units (Phira's NOTE_WIDTH_RATIO_BASE); farther fingers rank worse */
+const NOTE_WIDTH = 1.171;
+/** seconds of ranking penalty per note width past the first (Phira's DIST_FACTOR) */
+const DIST_FACTOR = 0.2;
+/** a hold may go untouched this long before it is missed */
+const UP_TOLERANCE = 0.05;
 
-export const Judgment = { Pending: 0, Perfect: 1, Good: 2, Miss: 3 } as const;
+export const Judgment = { Pending: 0, Perfect: 1, Good: 2, Bad: 3, Miss: 4 } as const;
 export type Judgment = (typeof Judgment)[keyof typeof Judgment];
 
 export interface Hit {
@@ -29,20 +40,31 @@ interface NoteTiming {
     x: number;
 }
 
+interface HoldState {
+    perfect: boolean;
+    /** when the last finger left it, or Infinity while touched */
+    up: number;
+    /** close enough to its end that it can no longer be missed */
+    safe: boolean;
+}
+
 export class PlaySession {
     readonly notes: NoteTiming[];
     readonly results: Uint8Array;
-    /** hold notes being held, with the judgment of their head */
-    readonly holding = new Map<number, Judgment>();
+    /** hold notes being held */
+    readonly holding = new Map<number, HoldState>();
+    /** drags and flicks already caught, counted once their time comes */
+    private readonly caught = new Set<number>();
     private readonly touches = new Map<number, number>();
     private next = 0;
     combo = 0;
     maxCombo = 0;
-    readonly counts = { perfect: 0, good: 0, miss: 0 };
+    readonly counts = { perfect: 0, good: 0, bad: 0, miss: 0 };
 
     constructor(chart: OfficialChart) {
         const line = chart.judgeLineList[0];
         const spu = 1.875 / line.bpm;
+        // indices match the chart's notes (the renderer hides notes by index); generated charts are in time order
         this.notes = line.notesAbove.map(n => ({ type: n.type, time: n.time * spu, end: (n.time + n.holdTime) * spu, x: n.positionX }));
         this.results = new Uint8Array(this.notes.length);
     }
@@ -52,13 +74,14 @@ export class PlaySession {
     }
 
     get finished() {
-        return this.counts.perfect + this.counts.good + this.counts.miss === this.notes.length;
+        return this.counts.perfect + this.counts.good + this.counts.bad + this.counts.miss === this.notes.length;
     }
 
     private record(index: number, judgment: Judgment, hits: Hit[]) {
         this.results[index] = judgment;
-        if (judgment === Judgment.Miss) {
-            this.counts.miss++;
+        if (judgment === Judgment.Miss || judgment === Judgment.Bad) {
+            if (judgment === Judgment.Miss) this.counts.miss++;
+            else this.counts.bad++;
             this.combo = 0;
         } else {
             if (judgment === Judgment.Perfect) this.counts.perfect++;
@@ -69,22 +92,28 @@ export class PlaySession {
         hits.push({ index, judgment });
     }
 
-    /** Pending notes of the given types whose window contains `time`, best match first. */
-    private candidate(time: number, x: number, types: OfficialNote['type'][]) {
-        let best = -1;
-        let bestScore = Infinity;
+    /**
+     * The note a touch at `x` goes to, as Phira ranks them: by timing (late touches get LATE_ALLOWANCE,
+     * drags and flicks rank GOOD_WINDOW worse) plus a penalty for distance past one note width.
+     */
+    private closest(time: number, x: number, press: boolean): { index: number; dt: number } | null {
+        let best: { index: number; dt: number } | null = null;
+        let bestKey = BAD_WINDOW + Math.max(REACH / NOTE_WIDTH - 1, 0) * DIST_FACTOR;
         for (let i = this.next; i < this.notes.length; i++) {
             const note = this.notes[i];
-            if (note.time - time > GOOD_WINDOW) break;
-            if (this.results[i] !== Judgment.Pending || this.holding.has(i) || !types.includes(note.type)) continue;
-            const dt = Math.abs(note.time - time);
-            const dx = Math.abs(note.x - x);
-            if (dt > GOOD_WINDOW || dx > REACH) continue;
-            // earliest first, then nearest (for chords)
-            const score = dt + dx * 0.01;
-            if (score < bestScore) {
-                bestScore = score;
-                best = i;
+            if (this.results[i] !== Judgment.Pending || this.holding.has(i)) continue;
+            if (!press && (note.type === 1 || note.type === 3)) continue;
+            const early = note.time - time;
+            if (early >= bestKey) break;
+            const dt = early < 0 ? Math.abs(Math.min(early + LATE_ALLOWANCE, 0)) : early;
+            const dist = Math.abs(note.x - x);
+            if (dist > REACH) continue;
+            if (dt > (note.type === 1 ? BAD_WINDOW : GOOD_WINDOW)) continue;
+            const ranked = note.type === 2 || note.type === 4 ? dt + GOOD_WINDOW : dt;
+            const key = ranked + Math.max(dist / NOTE_WIDTH - 1, 0) * DIST_FACTOR;
+            if (key < bestKey) {
+                bestKey = key;
+                best = { index: i, dt };
             }
         }
         return best;
@@ -93,25 +122,28 @@ export class PlaySession {
     press(id: number, x: number, time: number): Hit[] {
         this.touches.set(id, x);
         const hits: Hit[] = [];
-        const i = this.candidate(time, x, [1, 3]);
-        if (i < 0) return hits;
-        const judgment = Math.abs(this.notes[i].time - time) <= PERFECT_WINDOW ? Judgment.Perfect : Judgment.Good;
-        if (this.notes[i].type === 3) {
-            this.holding.set(i, judgment);
-            hits.push({ index: i, judgment });
+        const found = this.closest(time, x, true);
+        if (!found) return hits;
+        const { index, dt } = found;
+        const note = this.notes[index];
+        // a drag or flick that matches best takes the touch: the tap behind it is not hit
+        if (note.type === 2 || note.type === 4) return hits;
+        if (note.type === 3) {
+            this.holding.set(index, { perfect: dt <= PERFECT_WINDOW, up: Infinity, safe: false });
+            hits.push({ index, judgment: dt <= PERFECT_WINDOW ? Judgment.Perfect : Judgment.Good });
         } else {
-            this.record(i, judgment, hits);
+            this.record(index, dt <= PERFECT_WINDOW ? Judgment.Perfect : dt <= GOOD_WINDOW ? Judgment.Good : Judgment.Bad, hits);
         }
         return hits;
     }
 
-    /** A finger swiped (moved far enough quickly) at `x`. */
-    swipe(id: number, x: number, time: number): Hit[] {
+    /** A finger flicked at `x`; returns whether the flick was used up. */
+    flick(id: number, x: number, time: number): boolean {
         this.moveTo(id, x);
-        const hits: Hit[] = [];
-        const i = this.candidate(time, x, [4]);
-        if (i >= 0) this.record(i, Judgment.Perfect, hits);
-        return hits;
+        const found = this.closest(time, x, false);
+        if (!found || this.notes[found.index].type !== 4) return false;
+        this.caught.add(found.index);
+        return true;
     }
 
     /** Where a held-down finger is now (the line moves under resting fingers). */
@@ -123,34 +155,56 @@ export class PlaySession {
         this.touches.delete(id);
     }
 
-    private touching(x: number, reach = REACH) {
-        for (const tx of this.touches.values()) if (Math.abs(tx - x) <= reach) return true;
+    private touching(x: number) {
+        for (const tx of this.touches.values()) if (Math.abs(tx - x) <= REACH) return true;
         return false;
     }
 
-    /** Advances to `time`: catches drags under fingers, settles holds, and misses what has passed. */
+    /** Advances to `time`: catches drags under fingers, settles holds and caught notes, and misses what has passed. */
     update(time: number): Hit[] {
         const hits: Hit[] = [];
         for (let i = this.next; i < this.notes.length; i++) {
             const note = this.notes[i];
-            if (note.time - time > GOOD_WINDOW) break;
             if (this.results[i] !== Judgment.Pending) continue;
 
-            if (this.holding.has(i)) {
-                if (time >= note.end - HOLD_RELEASE_GRACE) {
-                    this.record(i, this.holding.get(i)!, hits);
-                    this.holding.delete(i);
-                } else if (!this.touching(note.x, REACH * 1.5)) {
-                    this.holding.delete(i);
-                    this.record(i, Judgment.Miss, hits);
+            const hold = this.holding.get(i);
+            if (hold) {
+                if (note.end - time <= BAD_WINDOW) hold.safe = true;
+                if (hold.safe) {
+                    if (time >= note.end) {
+                        this.holding.delete(i);
+                        this.record(i, hold.perfect ? Judgment.Perfect : Judgment.Good, hits);
+                    }
+                } else if (!this.touching(note.x)) {
+                    if (time > hold.up + UP_TOLERANCE) {
+                        this.holding.delete(i);
+                        this.record(i, Judgment.Miss, hits);
+                    } else if (!Number.isFinite(hold.up)) {
+                        hold.up = time;
+                    }
+                } else {
+                    hold.up = Infinity;
                 }
                 continue;
             }
-            if (note.type === 2 && time >= note.time - PERFECT_WINDOW && this.touching(note.x)) {
-                this.record(i, Judgment.Perfect, hits);
+
+            const late = time - note.time;
+            if (this.caught.has(i)) {
+                if (late >= 0) {
+                    this.caught.delete(i);
+                    this.record(i, Judgment.Perfect, hits);
+                }
                 continue;
             }
-            if (time - note.time > GOOD_WINDOW) this.record(i, Judgment.Miss, hits);
+            if (late > BAD_WINDOW) {
+                this.record(i, Judgment.Miss, hits);
+                continue;
+            }
+            if (-late > BAD_WINDOW) break;
+            if (note.type === 2 && this.touching(note.x)) {
+                if (late >= 0) this.record(i, Judgment.Perfect, hits);
+                else this.caught.add(i);
+            }
         }
         while (this.next < this.notes.length && this.results[this.next] !== Judgment.Pending) this.next++;
         return hits;

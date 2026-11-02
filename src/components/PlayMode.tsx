@@ -28,13 +28,22 @@ interface Effect {
     color: string;
 }
 
+/** a finger on the screen, with Phira's flick tracking (prpr/src/judge.rs FlickTracker) */
 interface Finger {
     x: number;
     y: number;
-    anchorX: number;
-    anchorY: number;
-    anchorTime: number;
+    /** real time of the last move, in seconds */
+    lastTime: number;
+    /** direction of the last move (unit vector), once it has moved */
+    direction: { x: number; y: number } | null;
+    /** has slowed down (or not moved yet) since its last flick */
+    stopped: boolean;
+    /** a flick waiting for a flick note */
+    flicked: boolean;
 }
+
+// Phira's flick speed: FLICK_SPEED_THRESHOLD 0.8 at its reference dpi (275 / 386), in half screen widths per second
+const FLICK_SPEED = 0.8 * (275 / 386);
 
 const EFFECT_SECONDS = 0.35;
 // seconds counted down after resuming, during which the chart stays still
@@ -55,7 +64,7 @@ export const PlayMode: React.FC<PlayModeProps> = ({ chart, audio, title, difficu
     const [combo, setCombo] = useState(0);
     const [countdown, setCountdown] = useState(0);
     const [portrait, setPortrait] = useState(false);
-    const [summary, setSummary] = useState<{ perfect: number; good: number; miss: number; maxCombo: number; total: number } | null>(null);
+    const [summary, setSummary] = useState<{ perfect: number; good: number; bad: number; miss: number; maxCombo: number; total: number } | null>(null);
 
     const line = chart.judgeLineList[0];
     const lastEnd = line.notesAbove.reduce((m, n) => Math.max(m, ((n.time + n.holdTime) * 1.875) / line.bpm), 0);
@@ -139,8 +148,12 @@ export const PlayMode: React.FC<PlayModeProps> = ({ chart, audio, title, difficu
         if (!canvas || !g || !session) return;
         const time = songTime();
 
-        // fingers resting on a moving line slide along it
-        for (const [id, finger] of fingersRef.current) session.moveTo(id, project(finger.x, finger.y, time));
+        // fingers resting on a moving line slide along it; a flick not yet used waits for its note
+        for (const [id, finger] of fingersRef.current) {
+            const x = project(finger.x, finger.y, time);
+            session.moveTo(id, x);
+            if (finger.flicked && session.flick(id, x, time)) finger.flicked = false;
+        }
         handleHits(session.update(time), time);
 
         renderChart(g, chart, time, canvas.width, canvas.height, {
@@ -259,7 +272,7 @@ export const PlayMode: React.FC<PlayModeProps> = ({ chart, audio, title, difficu
         }
         const { x, y } = toCanvas(e);
         const time = songTime();
-        fingersRef.current.set(e.pointerId, { x, y, anchorX: x, anchorY: y, anchorTime: time });
+        fingersRef.current.set(e.pointerId, { x, y, lastTime: performance.now() / 1000, direction: null, stopped: true, flicked: false });
         handleHits(sessionRef.current.press(e.pointerId, project(x, y, time), time), time);
     };
 
@@ -269,19 +282,26 @@ export const PlayMode: React.FC<PlayModeProps> = ({ chart, audio, title, difficu
         if (!finger || !session || phase !== 'playing') return;
         const { x, y } = toCanvas(e);
         const time = songTime();
+        // as Phira: a flick is a move at twice the threshold speed after the finger has slowed below it
+        const now = performance.now() / 1000;
+        const dt = Math.max(now - finger.lastTime, 1e-3);
+        const threshold = (FLICK_SPEED * canvasRef.current!.width) / 2;
+        const dx = x - finger.x;
+        const dy = y - finger.y;
+        const length = Math.hypot(dx, dy);
+        if (length > 0) {
+            if (finger.direction) {
+                if ((dx * finger.direction.x + dy * finger.direction.y) / dt < threshold) finger.stopped = true;
+                if (finger.stopped && !finger.flicked) finger.flicked = length / dt >= threshold * 2;
+            }
+            finger.direction = { x: dx / length, y: dy / length };
+        }
         finger.x = x;
         finger.y = y;
-        // a swipe is a quick move of a few percent of the screen height
-        if (time - finger.anchorTime > 0.15) {
-            finger.anchorX = x;
-            finger.anchorY = y;
-            finger.anchorTime = time;
-        } else if (Math.hypot(x - finger.anchorX, y - finger.anchorY) >= canvasRef.current!.height * 0.03) {
-            handleHits(session.swipe(e.pointerId, project(x, y, time), time), time);
-            finger.anchorX = x;
-            finger.anchorY = y;
-            finger.anchorTime = time;
-        }
+        finger.lastTime = now;
+        const along = project(x, y, time);
+        session.moveTo(e.pointerId, along);
+        if (finger.flicked && session.flick(e.pointerId, along, time)) finger.flicked = false;
     };
 
     const onPointerUp = (e: React.PointerEvent) => {
@@ -336,7 +356,7 @@ export const PlayMode: React.FC<PlayModeProps> = ({ chart, audio, title, difficu
                     <div className="w-[220px]"><DifficultyCard difficulty={difficulty} level={level} /></div>
                     <span className="text-[15px] text-slate-300">轻触屏幕开始</span>
                     <span className="text-[12px] text-slate-500 max-w-[420px] text-center leading-relaxed">
-                        蓝色：点击 · 黄色：手指放在音符经过的位置 · 红色：在音符附近滑动 · 长条：按住到结束
+                        蓝色：点击 · 黄色：手指放在音符经过的位置 · 红色：在音符附近快速划动 · 长条：按住到结束 · 判定与 Phira 相同
                     </span>
                     {portrait && <span className="text-[13px] text-[#fbbf24]">建议把 iPad 横过来玩</span>}
                 </button>
@@ -363,9 +383,10 @@ export const PlayMode: React.FC<PlayModeProps> = ({ chart, audio, title, difficu
                 <div className={overlay}>
                     <span className="text-[24px] font-semibold">{title}</span>
                     <div className="w-[240px]"><DifficultyCard difficulty={difficulty} level={level} /></div>
-                    <div className="grid grid-cols-4 gap-6 text-center">
+                    <div className="grid grid-cols-5 gap-6 text-center">
                         <div><div className="text-[28px] font-bold text-[#ffe17a]">{summary.perfect}</div><div className="text-[12px] text-slate-400">完美</div></div>
                         <div><div className="text-[28px] font-bold text-[#7dd3fc]">{summary.good}</div><div className="text-[12px] text-slate-400">良好</div></div>
+                        <div><div className="text-[28px] font-bold text-[#fb923c]">{summary.bad}</div><div className="text-[12px] text-slate-400">差</div></div>
                         <div><div className="text-[28px] font-bold text-[#f87171]">{summary.miss}</div><div className="text-[12px] text-slate-400">失误</div></div>
                         <div><div className="text-[28px] font-bold">{summary.maxCombo}<span className="text-[15px] text-slate-500">/{summary.total}</span></div><div className="text-[12px] text-slate-400">最大连击</div></div>
                     </div>
