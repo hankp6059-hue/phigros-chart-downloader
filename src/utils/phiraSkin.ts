@@ -12,8 +12,8 @@ import JSZip from 'jszip';
 
 const NOTE_WIDTH = 1000;
 /** multi-press textures are wider by their glow; Phira scales them by their width over the plain one */
-const MH_PAD = 40;
-const GOLD = '#ffe27a';
+const MH_PAD = 36;
+const GLOW = '#f2ec5c';
 
 const canvasOf = (width: number, height: number) => {
     const canvas = document.createElement('canvas');
@@ -25,140 +25,146 @@ const canvasOf = (width: number, height: number) => {
 const toPng = (canvas: HTMLCanvasElement) => new Promise<Blob>((resolve, reject) =>
     canvas.toBlob(blob => (blob ? resolve(blob) : reject(new Error('could not draw the resource pack'))), 'image/png'));
 
-interface Palette { light: string; mid: string; dark: string }
-const TAP: Palette = { light: '#d6f6ff', mid: '#8fdcf4', dark: '#2a9fd8' };
-const DRAG: Palette = { light: '#fffbd6', mid: '#f4ea86', dark: '#d8c33a' };
-const FLICK: Palette = { light: '#ffd0d8', mid: '#fb7f95', dark: '#e0304f' };
+// measured on a screen recording of the original (a tap is ~290 x 30 px on a 2360 px wide screen)
+/** a note's height, as a share of its width */
+const NOTE_HEIGHT = 92;
+const TAP_FILL = '#11b6f6';
+const DRAG_FILL = '#ece34f';
+const FLICK_FILL = '#ef3d5c';
 
-/**
- * A note across [left, left + width] and [top, top + height], as the original draws its notes: a rounded
- * capsule with a white rim, a pale body and a deeper stripe along the middle, and curved bracket marks just
- * outside both ends.
- */
-const drawBar = (g: CanvasRenderingContext2D, left: number, top: number, width: number, height: number, palette: Palette) => {
-    const bracket = Math.max(12, height * 0.35);
-    const x0 = left + bracket;
-    const x1 = left + width - bracket;
-    const cy = top + height / 2;
-    const capsule = (inset: number) => {
-        const r = height / 2 - inset;
-        g.beginPath();
-        g.moveTo(x0 + r, cy - r);
-        g.lineTo(x1 - r, cy - r);
-        g.arc(x1 - r, cy, r, -Math.PI / 2, Math.PI / 2);
-        g.lineTo(x0 + r, cy + r);
-        g.arc(x0 + r, cy, r, Math.PI / 2, (3 * Math.PI) / 2);
-        g.closePath();
-    };
-    // pale body
-    const body = g.createLinearGradient(0, top, 0, top + height);
-    body.addColorStop(0, palette.light);
-    body.addColorStop(1, palette.mid);
-    g.fillStyle = body;
-    capsule(height * 0.08);
+type Path = [number, number][];
+const fillPath = (g: CanvasRenderingContext2D, points: Path) => {
+    g.beginPath();
+    points.forEach(([x, y], i) => (i ? g.lineTo(x, y) : g.moveTo(x, y)));
+    g.closePath();
     g.fill();
-    // deeper stripe along the middle
-    g.fillStyle = palette.dark;
-    const stripe = height * 0.17;
-    g.fillRect(x0 + height * 0.45, cy - stripe, x1 - x0 - height * 0.9, stripe * 2);
-    // white rim
-    g.strokeStyle = '#ffffff';
-    g.lineWidth = Math.max(3, height * 0.1);
-    capsule(height * 0.08);
-    g.stroke();
-    // curved brackets just outside both ends
-    g.lineWidth = Math.max(3, height * 0.09);
-    g.lineCap = 'round';
-    for (const side of [-1, 1]) {
-        const cx = side < 0 ? x0 + height / 2 : x1 - height / 2;
-        const r = height / 2 + bracket * 0.45;
-        const from = side < 0 ? Math.PI * 0.72 : -Math.PI * 0.28;
-        g.beginPath();
-        g.arc(cx, cy, r, from, from + Math.PI * 0.56);
-        g.stroke();
-    }
+};
+/** an elongated hexagon from x0 to x1, centred on cy, `h` high, its ends pointed by `tip` */
+const hexagon = (x0: number, x1: number, cy: number, h: number, tip: number): Path => [
+    [x0 + tip, cy - h / 2], [x1 - tip, cy - h / 2], [x1, cy], [x1 - tip, cy + h / 2], [x0 + tip, cy + h / 2], [x0, cy],
+];
+/** a chevron pointing out of the note (side -1: left), its tip at `x` */
+const chevron = (x: number, cy: number, h: number, thickness: number, side: number): Path => {
+    const depth = h * 0.42 * -side;
+    return [[x, cy], [x + depth, cy - h / 2], [x + depth - side * thickness, cy - h / 2], [x - side * thickness, cy], [x + depth - side * thickness, cy + h / 2], [x + depth, cy + h / 2]];
 };
 
-/** the multi-press glow: a soft gold halo with a gold outline around the whole note, rounded like it */
-const drawGlow = (g: CanvasRenderingContext2D, left: number, top: number, width: number, height: number) => {
-    const r = height / 2 + 10;
-    const path = () => {
-        g.beginPath();
-        g.moveTo(left + r - 10, top - 10);
-        g.lineTo(left + width - r + 10, top - 10);
-        g.arc(left + width - r + 10, top + height / 2, r, -Math.PI / 2, Math.PI / 2);
-        g.lineTo(left + r - 10, top + height + 10);
-        g.arc(left + r - 10, top + height / 2, r, Math.PI / 2, (3 * Math.PI) / 2);
-        g.closePath();
-    };
+/**
+ * A note as the original draws it, across [left, left + width] centred on cy: a white frame shaped as a long
+ * hexagon (pointed ends), the coloured bar inside it with pointed ends too, and a detached white chevron past
+ * each end. `split` leaves a gap in the middle of the bar (the flick's mark sits there).
+ */
+const drawNote = (g: CanvasRenderingContext2D, left: number, cy: number, width: number, h: number, fill: string, split = 0) => {
+    const chevronWidth = h * 0.42;
+    const frame0 = left + chevronWidth + h * 0.14;
+    const frame1 = left + width - chevronWidth - h * 0.14;
+    g.fillStyle = '#ffffff';
+    fillPath(g, hexagon(frame0, frame1, cy, h, h * 0.28));
+    fillPath(g, chevron(left + h * 0.02, cy, h * 0.9, h * 0.2, -1));
+    fillPath(g, chevron(left + width - h * 0.02, cy, h * 0.9, h * 0.2, 1));
+    const inset = h * 0.21;
+    g.fillStyle = fill;
+    const bar = hexagon(frame0 + inset, frame1 - inset, cy, h - inset * 2, (h - inset * 2) * 0.35);
+    if (!split) {
+        fillPath(g, bar);
+        return;
+    }
+    const mid = (frame0 + frame1) / 2;
     g.save();
-    g.shadowColor = GOLD;
-    g.shadowBlur = 26;
-    g.fillStyle = 'rgba(255,226,122,0.28)';
-    path();
-    g.fill();
-    g.strokeStyle = GOLD;
-    g.lineWidth = 6;
-    path();
-    g.stroke();
+    g.beginPath();
+    g.rect(0, 0, mid - split / 2, cy * 2 + h);
+    g.rect(mid + split / 2, 0, g.canvas.width, cy * 2 + h);
+    g.clip();
+    fillPath(g, bar);
     g.restore();
 };
 
-/** two white chevrons pointing up, centred on the bar: the flick's mark */
-const drawChevrons = (g: CanvasRenderingContext2D, cx: number, top: number, height: number) => {
-    g.strokeStyle = '#ffffff';
-    g.lineWidth = Math.max(4, height * 0.09);
-    g.lineCap = 'round';
-    g.lineJoin = 'round';
-    const w = height * 0.55;
-    for (const offset of [-w * 0.8, w * 0.8]) {
-        g.beginPath();
-        g.moveTo(cx + offset - w / 2, top + height * 0.68);
-        g.lineTo(cx + offset, top + height * 0.3);
-        g.lineTo(cx + offset + w / 2, top + height * 0.68);
-        g.stroke();
-    }
+/**
+ * the flick's mark: a white lightning bolt standing across the bar, two slanted strokes stepped apart at the
+ * middle, each with a small red notch
+ */
+const drawBolt = (g: CanvasRenderingContext2D, cx: number, cy: number, h: number) => {
+    const u = h;
+    const stroke = 0.44 * u;
+    const lean = 0.3 * u;
+    const step = 0.13 * u;
+    g.fillStyle = '#ffffff';
+    // upper stroke: from the top, leaning down to the left, ending at the middle
+    fillPath(g, [[cx + lean - stroke / 2 + step, cy - 1.15 * u], [cx + lean + stroke / 2 + step, cy - 1.15 * u],
+        [cx + stroke / 2 + step, cy + 0.08 * u], [cx - stroke / 2 + step, cy + 0.08 * u]]);
+    // lower stroke: stepped to the left, from the middle on down
+    fillPath(g, [[cx - stroke / 2 - step, cy - 0.08 * u], [cx + stroke / 2 - step, cy - 0.08 * u],
+        [cx - lean + stroke / 2 - step, cy + 1.15 * u], [cx - lean - stroke / 2 - step, cy + 1.15 * u]]);
+    g.fillStyle = FLICK_FILL;
+    fillPath(g, [[cx + lean + step - 0.02 * u, cy - 0.92 * u], [cx + lean + step + 0.1 * u, cy - 0.92 * u], [cx + lean + step - 0.02 * u, cy - 0.74 * u]]);
+    fillPath(g, [[cx - lean - step + 0.02 * u, cy + 0.92 * u], [cx - lean - step - 0.1 * u, cy + 0.92 * u], [cx - lean - step + 0.02 * u, cy + 0.74 * u]]);
 };
 
-/** A note texture: `height` is the bar's height; multi-press versions add room for the glow on every side. */
-const noteTexture = (palette: Palette, height: number, multi: boolean, mark?: (g: CanvasRenderingContext2D, cx: number, top: number, h: number) => void) => {
+/** the multi-press glow: draws `shape` again under a yellow halo that follows its outline */
+const withGlow = (g: CanvasRenderingContext2D, shape: () => void) => {
+    g.save();
+    g.shadowColor = GLOW;
+    for (const blur of [26, 14]) {
+        g.shadowBlur = blur;
+        shape();
+    }
+    g.restore();
+};
+
+/** A note texture; flicks are taller to hold the bolt, and multi-press versions add room for the glow. */
+const noteTexture = (fill: string, height: number, multi: boolean, flick = false) => {
     const pad = multi ? MH_PAD : 0;
-    const { canvas, g } = canvasOf(NOTE_WIDTH + pad * 2, height + pad * 2);
-    if (multi) drawGlow(g, pad, pad, NOTE_WIDTH, height);
-    drawBar(g, pad, pad, NOTE_WIDTH, height, palette);
-    mark?.(g, pad + NOTE_WIDTH / 2, pad, height);
+    const boltRoom = flick ? height * 0.75 : 0;
+    const { canvas, g } = canvasOf(NOTE_WIDTH + pad * 2, height + (boltRoom + pad) * 2);
+    const cy = canvas.height / 2;
+    const draw = () => {
+        drawNote(g, pad, cy, NOTE_WIDTH, height, fill, flick ? height * 0.95 : 0);
+        if (flick) drawBolt(g, pad + NOTE_WIDTH / 2, cy, height);
+    };
+    if (multi) withGlow(g, draw);
+    draw();
     return canvas;
 };
 
-// hold texture: tail cap on top, translucent body, tap-like head at the bottom
-const HOLD_TAIL = 40;
+// hold texture: a light cyan body, lighter towards the head, with a thin lighter stripe inside each side and
+// a white rim outside it, the corners chamfered at both ends. the ends are the tail (top) and head (bottom)
+const HOLD_END = 50;
 const HOLD_BODY = 400;
-const HOLD_HEAD = 100;
 
 const holdTexture = (multi: boolean) => {
     const pad = multi ? MH_PAD : 0;
     const width = NOTE_WIDTH + pad * 2;
-    const height = HOLD_TAIL + HOLD_BODY + HOLD_HEAD + pad * 2;
+    const height = HOLD_END * 2 + HOLD_BODY + pad * 2;
     const { canvas, g } = canvasOf(width, height);
-    // the body is as wide as the note: light, translucent cyan with thin white sides
-    const bodyTop = pad + HOLD_TAIL * 0.5;
-    const bodyBottom = height - pad - HOLD_HEAD * 0.5;
-    const body = g.createLinearGradient(0, bodyTop, 0, bodyBottom);
-    body.addColorStop(0, 'rgba(160,236,255,0.35)');
-    body.addColorStop(1, 'rgba(120,226,255,0.65)');
+    const left = pad + 30;
+    const right = pad + NOTE_WIDTH - 30;
+    const top = pad + 6;
+    const bottom = height - pad - 6;
+    const cut = HOLD_END * 0.7;
+    const outline: Path = [[left + cut, top], [right - cut, top], [right, top + cut], [right, bottom - cut], [right - cut, bottom], [left + cut, bottom], [left, bottom - cut], [left, top + cut]];
+    const rim = () => {
+        g.strokeStyle = '#ffffff';
+        g.lineWidth = 12;
+        g.lineJoin = 'miter';
+        g.beginPath();
+        outline.forEach(([x, y], i) => (i ? g.lineTo(x, y) : g.moveTo(x, y)));
+        g.closePath();
+        g.stroke();
+    };
+    if (multi) withGlow(g, rim);
+    rim();
+    // the body sits inside the rim with a narrow gap
+    const gap = 18;
+    const inner: Path = [[left + cut + gap * 0.4, top + gap], [right - cut - gap * 0.4, top + gap], [right - gap, top + cut], [right - gap, bottom - cut], [right - cut - gap * 0.4, bottom - gap], [left + cut + gap * 0.4, bottom - gap], [left + gap, bottom - cut], [left + gap, top + cut]];
+    const body = g.createLinearGradient(0, top, 0, bottom);
+    body.addColorStop(0, 'rgba(176,222,238,0.88)');
+    body.addColorStop(1, 'rgba(150,232,252,0.96)');
     g.fillStyle = body;
-    g.fillRect(pad + 10, bodyTop, NOTE_WIDTH - 20, bodyBottom - bodyTop);
-    g.fillStyle = 'rgba(255,255,255,0.8)';
-    g.fillRect(pad + 10, bodyTop, 8, bodyBottom - bodyTop);
-    g.fillRect(pad + NOTE_WIDTH - 18, bodyTop, 8, bodyBottom - bodyTop);
-    // the tail: a thin white cap
-    g.fillStyle = 'rgba(255,255,255,0.9)';
-    g.fillRect(pad + 10, pad + HOLD_TAIL * 0.5 - 4, NOTE_WIDTH - 20, 8);
-    // the head, like a tap
-    const headTop = height - pad - HOLD_HEAD;
-    if (multi) drawGlow(g, pad, headTop, NOTE_WIDTH, HOLD_HEAD);
-    drawBar(g, pad, headTop, NOTE_WIDTH, HOLD_HEAD, TAP);
-    return { canvas, atlas: [HOLD_TAIL + pad, HOLD_HEAD + pad] as [number, number] };
+    fillPath(g, inner);
+    g.fillStyle = 'rgba(190,242,255,0.7)';
+    g.fillRect(left + gap + 14, top + cut, 22, bottom - top - cut * 2);
+    g.fillRect(right - gap - 36, top + cut, 22, bottom - top - cut * 2);
+    return { canvas, atlas: [HOLD_END + pad, HOLD_END + pad] as [number, number] };
 };
 
 // hit effect, as the original's: two level square frames growing apart over a faint diamond, arcs circling
@@ -222,12 +228,12 @@ const hitFxTexture = () => {
 export const buildPhiraSkin = async (): Promise<Blob> => {
     const zip = new JSZip();
     const add = async (name: string, canvas: HTMLCanvasElement) => zip.file(name, await toPng(canvas));
-    await add('click.png', noteTexture(TAP, 100, false));
-    await add('click_mh.png', noteTexture(TAP, 100, true));
-    await add('drag.png', noteTexture(DRAG, 60, false));
-    await add('drag_mh.png', noteTexture(DRAG, 60, true));
-    await add('flick.png', noteTexture(FLICK, 120, false, drawChevrons));
-    await add('flick_mh.png', noteTexture(FLICK, 120, true, drawChevrons));
+    await add('click.png', noteTexture(TAP_FILL, NOTE_HEIGHT, false));
+    await add('click_mh.png', noteTexture(TAP_FILL, NOTE_HEIGHT, true));
+    await add('drag.png', noteTexture(DRAG_FILL, NOTE_HEIGHT * 0.8, false));
+    await add('drag_mh.png', noteTexture(DRAG_FILL, NOTE_HEIGHT * 0.8, true));
+    await add('flick.png', noteTexture(FLICK_FILL, NOTE_HEIGHT, false, true));
+    await add('flick_mh.png', noteTexture(FLICK_FILL, NOTE_HEIGHT, true, true));
     const hold = holdTexture(false);
     const holdMh = holdTexture(true);
     await add('hold.png', hold.canvas);
