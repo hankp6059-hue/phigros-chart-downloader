@@ -5,6 +5,7 @@
 import type { OfficialChart, OfficialNote } from './chartConverter';
 import { BASE_Y, LineMotion, LinePose, buildLineMotion, readBarMoods } from './lineMotion';
 import { SpeedChange, buildScrollSpeed } from './scrollSpeed';
+import { Choreography, buildChoreography } from './choreography';
 import { PLACEMENT_FEATURES, placementScore } from './placementModel';
 
 export type GeneratorDifficulty = 'EZ' | 'HD' | 'IN' | 'AT';
@@ -61,6 +62,8 @@ export interface GeneratedChart {
     chart: OfficialChart;
     /** present when the line is animated */
     motion?: LineMotion;
+    /** performances of extra judgment lines (present with line motion) */
+    choreography?: Choreography;
     /** difficulty constant on the official scale */
     level: number;
     /** scroll speed over the song (official units) */
@@ -1240,18 +1243,42 @@ export const generateChart = (analysis: AudioAnalysis, options: GeneratorOptions
 
     const constant = (value: number) => ({ startTime: EVENT_START, endTime: EVENT_END, start: value, end: value });
 
-    let moveEvents: OfficialChart['judgeLineList'][number]['judgeLineMoveEvents'] = [{ ...constant(0.5), start2: BASE_Y, end2: BASE_Y }];
-    let rotateEvents = [constant(0)];
-    let alphaEvents = [constant(1)];
+    // extra judgment lines staged to the song (with line motion only); notes stay on the main line unless a
+    // parallel extra line carries them
+    const accentAt = (time: number) => {
+        const frame = frameAt(time);
+        let peak = 0;
+        for (let f = frame - 2; f <= frame + 2; f++) peak = Math.max(peak, valueAt(envelope, f), valueAt(bassEnvelope, f));
+        return peak;
+    };
+    const choreography = motion ? buildChoreography({
+        difficulty: options.difficulty,
+        bpm: options.bpm,
+        firstBeat,
+        bars: motion.bars,
+        character: motion.character,
+        noteTimes: officialNotes.map(n => toSeconds(n.time)),
+        accentAt,
+        seed: options.seed,
+    }) : undefined;
+    const lineOf = officialNotes.map(n => choreography?.noteLine(toSeconds(n.time), toSeconds(n.time + n.holdTime), n.positionX) ?? -1);
+
+    type LineEvents = Pick<OfficialChart['judgeLineList'][number], 'judgeLineMoveEvents' | 'judgeLineRotateEvents' | 'judgeLineDisappearEvents'>;
+    const lineEvents: LineEvents[] = [{
+        judgeLineMoveEvents: [{ ...constant(0.5), start2: BASE_Y, end2: BASE_Y }],
+        judgeLineRotateEvents: [constant(0)],
+        judgeLineDisappearEvents: [constant(1)],
+    }];
     if (motion) {
         const lastTime = officialNotes.length ? officialNotes[officialNotes.length - 1].time + officialNotes[officialNotes.length - 1].holdTime : 0;
-        const end = Math.ceil((lastTime + 32 * 4) / MOTION_STEP) * MOTION_STEP;
-        const poses: { time: number; pose: LinePose }[] = [];
-        for (let time = 0; time <= end; time += MOTION_STEP) poses.push({ time, pose: motion.poseAt(toSeconds(time)) });
+        const choreographyEnd = choreography?.performances.reduce((m, p) => Math.max(m, toTime(p.end)), 0) ?? 0;
+        const end = Math.ceil((Math.max(lastTime + 32 * 4, choreographyEnd) + MOTION_STEP) / MOTION_STEP) * MOTION_STEP;
+        const mainPoses: { time: number; pose: LinePose }[] = [];
+        for (let time = 0; time <= end; time += MOTION_STEP) mainPoses.push({ time, pose: motion.poseAt(toSeconds(time)) });
         const round = (v: number) => Math.round(v * 1e5) / 1e5;
         const same = (a: number[], b: number[]) => a.every((v, i) => v === b[i]);
         // contiguous linear segments between samples, constant runs merged, held at both ends
-        const segments = (sample: (p: LinePose) => number[]) => {
+        const segments = (poses: { time: number; pose: LinePose }[], sample: (p: LinePose) => number[]) => {
             const values = poses.map(p => sample(p.pose).map(round));
             const result = [{ startTime: EVENT_START, endTime: 0, start: values[0], end: values[0] }];
             for (let i = 1; i < poses.length; i++) {
@@ -1266,36 +1293,42 @@ export const generateChart = (analysis: AudioAnalysis, options: GeneratorOptions
             result.push({ startTime: poses[poses.length - 1].time, endTime: EVENT_END, start: tail, end: tail });
             return result;
         };
-        moveEvents = segments(p => [p.x, p.y]).map(e => ({
-            startTime: e.startTime, endTime: e.endTime, start: e.start[0], end: e.end[0], start2: e.start[1], end2: e.end[1],
-        }));
-        rotateEvents = segments(p => [p.angle]).map(e => ({ startTime: e.startTime, endTime: e.endTime, start: e.start[0], end: e.end[0] }));
-        alphaEvents = segments(p => [p.alpha]).map(e => ({ startTime: e.startTime, endTime: e.endTime, start: e.start[0], end: e.end[0] }));
+        const toEvents = (poses: { time: number; pose: LinePose }[]): LineEvents => ({
+            judgeLineMoveEvents: segments(poses, p => [p.x, p.y]).map(e => ({
+                startTime: e.startTime, endTime: e.endTime, start: e.start[0], end: e.end[0], start2: e.start[1], end2: e.end[1],
+            })),
+            judgeLineRotateEvents: segments(poses, p => [p.angle]).map(e => ({ startTime: e.startTime, endTime: e.endTime, start: e.start[0], end: e.end[0] })),
+            judgeLineDisappearEvents: segments(poses, p => [p.alpha]).map(e => ({ startTime: e.startTime, endTime: e.endTime, start: e.start[0], end: e.end[0] })),
+        });
+        lineEvents[0] = toEvents(mainPoses);
+        for (let i = 0; i < (choreography?.lineCount ?? 0); i++) {
+            lineEvents.push(toEvents(mainPoses.map(({ time, pose }) => ({ time, pose: choreography!.poseAt(i, toSeconds(time), pose) }))));
+        }
     }
 
+    const speedEvents = speedSteps.map((step, i) => ({
+        startTime: step.time,
+        endTime: speedSteps[i + 1]?.time ?? EVENT_END,
+        value: step.value,
+        floorPosition: step.floor,
+    }));
     const chart: OfficialChart = {
         formatVersion: 3,
         offset: 0,
-        judgeLineList: [{
+        judgeLineList: lineEvents.map((events, line) => ({
             bpm: options.bpm,
-            judgeLineMoveEvents: moveEvents,
-            judgeLineRotateEvents: rotateEvents,
-            judgeLineDisappearEvents: alphaEvents,
-            speedEvents: speedSteps.map((step, i) => ({
-                startTime: step.time,
-                endTime: speedSteps[i + 1]?.time ?? EVENT_END,
-                value: step.value,
-                floorPosition: step.floor,
-            })),
-            notesAbove: officialNotes,
+            ...events,
+            speedEvents,
+            notesAbove: officialNotes.filter((_, i) => lineOf[i] === line - 1),
             notesBelow: [],
-        }],
+        })),
     };
 
     const count = (type: OfficialNote['type']) => officialNotes.filter(n => n.type === type).length;
     return {
         chart,
         motion,
+        choreography,
         level: Math.round(Math.min(16.9, rateNotes(officialNotes.map(n => ({ time: toSeconds(n.time), type: n.type }))) + LEVEL_CALIBRATION[options.difficulty]) * 10) / 10,
         speed: {
             min: Math.min(...speedSteps.map(step => step.value)),

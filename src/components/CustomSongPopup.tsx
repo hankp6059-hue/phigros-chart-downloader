@@ -8,6 +8,7 @@ import { PlayMode } from './PlayMode';
 import { encodeWav } from '../utils/wav';
 import { encodeOgg } from '../utils/oggEncode';
 import type { BarState } from '../utils/lineMotion';
+import type { Motif } from '../utils/choreography';
 import {
     AudioAnalysis,
     FINGERING_STYLES,
@@ -40,6 +41,11 @@ const FINGERING_LABELS: Record<FingeringStyle, string> = { single: '双手单指
 const FINGERING_HINTS: Record<FingeringStyle, string> = {
     single: '手机双拇指：每只手一个手指，快速连打左右交互',
     multi: '平板多指：每只手三指，可单手滚键、按住 Hold 时同手点键，双押更多',
+};
+
+const MOTIF_LABELS: Record<Motif, string> = {
+    split: '分线', stack: '叠线', fan: '扇形', cross: '交叉', orbit: '旋转', sweep: '横扫',
+    flyIn: '飞入', mirror: '镜像', pendulum: '钟摆', converge: '汇聚', shatter: '碎裂', pulse: '闪线',
 };
 
 const fileExtension = (file: File, fallback: string) => {
@@ -360,6 +366,12 @@ export const CustomSongPopup: React.FC<CustomSongPopupProps> = ({ isOpen, onClos
                                         高潮风格：弹跳 {Math.round(generated.motion.character.bounce * 100)}% · 钟摆 {Math.round(generated.motion.character.pendulum * 100)}% · 波浪 {Math.round(generated.motion.character.wave * 100)}%
                                     </span>
                                 </div>
+                                {generated.choreography && generated.choreography.performances.length > 0 && (
+                                    <p className="text-[11px] leading-[1.6] text-slate-400" title="按歌曲段落、重音和风格编排，每首歌不同">
+                                        判定线演出 {generated.choreography.performances.length} 段（{generated.choreography.lineCount + 1} 条线）：
+                                        {generated.choreography.performances.map(p => MOTIF_LABELS[p.motif]).join(' → ')}
+                                    </p>
+                                )}
                             </>
                         )}
                     </div>
@@ -373,7 +385,7 @@ export const CustomSongPopup: React.FC<CustomSongPopupProps> = ({ isOpen, onClos
                     音符放在哪里，由一个从 240 首官方谱面（曲库的 73%）里学到的模型决定，模仿谱师的取舍。键位按官方谱面的双手习惯来排，可选「双手单指」（手机双拇指）或「双手多指」（平板，每只手三指）：左手负责左半屏、右手负责右半屏，两手永不交叉；
                     快于单手连打的音符左右交互，慢一些时旋律上行交给右手、下行交给左手，每只手顺着旋律从上一个位置移动，移动距离不超过手指在这段时间里能到达的范围；
                     双押一手一个，Hold 由一只手按住时其余音符全部交给另一只手，音符之间不会重叠。键型的排布参照 96 张官方谱面：红色 Flick 落在重拍和乐句结尾，常成对出现或接在一串 Drag 后面（滑后划）；Flick 之后 0.3 秒内附近不放 Tap / Hold，避免划键时误触，紧跟的多是 Flick 或 Drag。黄色 Drag 是轻打和快速连音，连成一条随旋律扫动的线；双押会混搭键型（Drag+Tap、Hold+Tap、Flick+Tap、双 Flick），
-                    持续的长音是 Hold，其余是蓝色 Tap。流速跟着段落走：平缓、静默段放慢，铺垫段逐拍加速，爆发和高潮段提速（EZ 变化更小）。判定线按每小节的情绪运动：平缓处呼吸、律动处摇摆、铺垫时蓄力倾斜、爆发时回正下砸，
+                    持续的长音是 Hold，其余是蓝色 Tap。流速跟着段落走：平缓、静默段放慢，铺垫段逐拍加速，爆发和高潮段提速（EZ 变化更小）。额外的判定线按段落、重音和歌曲风格编排演出（分线、扇形、交叉、旋转、碎裂等），每首歌都不同，同一首歌重复的段落会以镜像重现；Hard 及以上，分线时右手音符走上面的线、左手走下面的线。主判定线按每小节的情绪运动：平缓处呼吸、律动处摇摆、铺垫时蓄力倾斜、爆发时回正下砸，
                     高潮的动法由歌曲本身的明亮度、密度和旋律起伏混合而成。物量和各种键的比例参照官方同难度谱面的中位数；定数由官方 516 张谱面拟合的公式自动评出（平均误差约 ±1）。
                     如果试听时打击音和节拍对不上，请修改 BPM 或偏移（正数让音符更晚出现）。导出格式与原程序一致，遵循设置里的「ZIP 格式」和「谱面格式转换」选项。
                 </p>
