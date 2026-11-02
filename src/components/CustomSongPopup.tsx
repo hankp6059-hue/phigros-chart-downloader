@@ -9,6 +9,7 @@ import { encodeWav } from '../utils/wav';
 import { encodeOgg } from '../utils/oggEncode';
 import type { BarState } from '../utils/lineMotion';
 import type { Motif } from '../utils/choreography';
+import { SavedSongSummary, deleteSavedSong, listSavedSongs, loadSavedSong, newSongId, saveSong } from '../utils/customSongStore';
 import {
     AudioAnalysis,
     FINGERING_STYLES,
@@ -117,6 +118,18 @@ export const CustomSongPopup: React.FC<CustomSongPopupProps> = ({ isOpen, onClos
     const [speedChanges, setSpeedChanges] = useState(true);
     const [fingering, setFingering] = useState<FingeringStyle>('single');
 
+    // songs saved in this browser; `savedId` is the one open (saving again updates it)
+    const [savedSongs, setSavedSongs] = useState<SavedSongSummary[]>([]);
+    const [savedId, setSavedId] = useState<string | null>(null);
+    const [saving, setSaving] = useState(false);
+    /** settings as last saved or opened, to tell whether there is anything new to save */
+    const [savedSnapshot, setSavedSnapshot] = useState<string | null>(null);
+    const [storageError, setStorageError] = useState<string | null>(null);
+    const refreshSaved = () => listSavedSongs().then(setSavedSongs).catch(() => setStorageError('这个浏览器无法保存歌曲（可能处于无痕模式或禁用了网站数据）。'));
+    useEffect(() => {
+        if (isOpen) refreshSaved();
+    }, [isOpen]);
+
     useEffect(() => {
         if (!coverFile) {
             setCoverUrl(null);
@@ -127,14 +140,15 @@ export const CustomSongPopup: React.FC<CustomSongPopupProps> = ({ isOpen, onClos
         return () => URL.revokeObjectURL(url);
     }, [coverFile]);
 
-    const handleAudio = async (file: File | undefined) => {
+    /** `saved`: BPM and offset of a saved song, kept instead of the detected ones */
+    const handleAudio = async (file: File | undefined, saved?: { bpm: string; offsetMs: string }) => {
         if (!file) return;
         setShowPreview(false);
         setError(null);
         setAudioFile(file);
         setAnalysis(null);
         setAudioBuffer(null);
-        if (!name) setName(file.name.replace(/\.[^.]+$/, ''));
+        if (!name && !saved) setName(file.name.replace(/\.[^.]+$/, ''));
         setIsAnalyzing(true);
         try {
             const context = new AudioContext();
@@ -146,8 +160,8 @@ export const CustomSongPopup: React.FC<CustomSongPopupProps> = ({ isOpen, onClos
             const result = analyzeAudio(channels, buffer.sampleRate);
             setAudioBuffer(buffer);
             setAnalysis(result);
-            setBpmInput(String(result.bpm));
-            setOffsetInput('0');
+            setBpmInput(saved?.bpm ?? String(result.bpm));
+            setOffsetInput(saved?.offsetMs ?? '0');
         } catch (e) {
             console.error(e);
             setAudioFile(null);
@@ -156,6 +170,102 @@ export const CustomSongPopup: React.FC<CustomSongPopupProps> = ({ isOpen, onClos
             setIsAnalyzing(false);
         }
     };
+
+    const snapshot = (values: { name: string; composer: string; charter: string; difficulty: string; levelOverride: string | null; bpm: string; offsetMs: string; lineMotion: boolean; speedChanges: boolean; fingering: string; cover: Blob | null }) =>
+        JSON.stringify([values.name, values.composer, values.charter, values.difficulty, values.levelOverride, values.bpm, values.offsetMs,
+            values.lineMotion, values.speedChanges, values.fingering, values.cover ? values.cover.size : null]);
+    const currentSnapshot = snapshot({ name: name.trim() || '未命名', composer: composer.trim(), charter: charter.trim(), difficulty, levelOverride, bpm: bpmInput, offsetMs: offsetInput, lineMotion, speedChanges, fingering, cover: coverFile });
+
+    const handleSave = async () => {
+        if (!audioFile) return;
+        setSaving(true);
+        setStorageError(null);
+        const id = savedId ?? newSongId();
+        try {
+            await saveSong({
+                id,
+                name: name.trim() || '未命名',
+                composer: composer.trim(),
+                charter: charter.trim(),
+                difficulty,
+                levelOverride,
+                bpm: bpmInput,
+                offsetMs: offsetInput,
+                lineMotion,
+                speedChanges,
+                fingering,
+                audio: audioFile,
+                audioName: audioFile.name,
+                cover: coverFile,
+                coverName: coverFile?.name ?? null,
+                savedAt: Date.now(),
+            });
+            setSavedId(id);
+            setSavedSnapshot(currentSnapshot);
+            refreshSaved();
+        } catch (e) {
+            console.error(e);
+            setStorageError('保存失败：浏览器的存储空间可能不足，或网站数据被禁用。');
+        } finally {
+            setSaving(false);
+        }
+    };
+
+    const openSaved = async (id: string) => {
+        try {
+            const song = await loadSavedSong(id);
+            if (!song) return refreshSaved();
+            setSavedId(id);
+            setSavedSnapshot(snapshot({ ...song, cover: song.cover }));
+            setName(song.name);
+            setComposer(song.composer);
+            setCharter(song.charter);
+            setDifficulty(song.difficulty);
+            setLevelOverride(song.levelOverride);
+            setLineMotion(song.lineMotion);
+            setSpeedChanges(song.speedChanges);
+            setFingering(song.fingering);
+            setCoverFile(song.cover ? new File([song.cover], song.coverName ?? 'cover.png', { type: song.cover.type }) : null);
+            await handleAudio(new File([song.audio], song.audioName, { type: song.audio.type }), { bpm: song.bpm, offsetMs: song.offsetMs });
+        } catch (e) {
+            console.error(e);
+            setStorageError('无法读取保存的歌曲。');
+        }
+    };
+
+    const removeSaved = async (song: SavedSongSummary) => {
+        if (!window.confirm(`从这个浏览器删除「${song.name}」？`)) return;
+        try {
+            await deleteSavedSong(song.id);
+            if (savedId === song.id) {
+                setSavedId(null);
+                setSavedSnapshot(null);
+            }
+            refreshSaved();
+        } catch (e) {
+            console.error(e);
+            setStorageError('删除失败。');
+        }
+    };
+
+    /** a fresh form for importing another song */
+    const startNew = () => {
+        setSavedId(null);
+        setSavedSnapshot(null);
+        setAudioFile(null);
+        setAudioBuffer(null);
+        setAnalysis(null);
+        setCoverFile(null);
+        setName('');
+        setComposer('');
+        setLevelOverride(null);
+        setBpmInput('');
+        setOffsetInput('0');
+        setShowPreview(false);
+        setError(null);
+    };
+
+    const upToDate = savedId !== null && currentSnapshot === savedSnapshot;
 
     const bpm = parseFloat(bpmInput);
     const bpmValid = Number.isFinite(bpm) && bpm >= 30 && bpm <= 400;
@@ -236,6 +346,29 @@ export const CustomSongPopup: React.FC<CustomSongPopupProps> = ({ isOpen, onClos
             <DialogHeader id="custom-song-title" eyebrow="自定义歌曲" title="导入歌曲并生成谱面" onClose={onClose} />
 
             <div className="flex-1 min-h-0 overflow-y-auto thin-scroll px-6 max-md:px-5 py-5 flex flex-col gap-5">
+                {savedSongs.length > 0 && (
+                    <div className="flex flex-col gap-2">
+                        <div className="flex items-center justify-between">
+                            <span className="text-[12px] font-medium text-slate-400">我的歌曲（保存在这个浏览器）</span>
+                            {(audioFile || savedId) && <Button variant="ghost" onClick={startNew}>导入新歌曲</Button>}
+                        </div>
+                        <ul className="flex flex-col rounded-xl border border-white/[.08] divide-y divide-white/[.06] max-h-[180px] overflow-y-auto thin-scroll">
+                            {savedSongs.map(song => (
+                                <li key={song.id} className={`flex items-center gap-3 px-3 py-2 ${song.id === savedId ? 'bg-[#22d3ee]/[.08]' : ''}`}>
+                                    <div className="flex-1 min-w-0">
+                                        <div className="text-[13px] text-slate-100 truncate">{song.name}</div>
+                                        <div className="text-[11px] text-slate-500 truncate">
+                                            {[song.composer, song.difficulty, `${(song.audioSize / 1048576).toFixed(1)} MB`, new Date(song.savedAt).toLocaleDateString()].filter(Boolean).join(' · ')}
+                                        </div>
+                                    </div>
+                                    <Button variant="outline" onClick={() => openSaved(song.id)} disabled={isAnalyzing}>{song.id === savedId ? '已打开' : '打开'}</Button>
+                                    <Button variant="ghost" onClick={() => removeSaved(song)}>删除</Button>
+                                </li>
+                            ))}
+                        </ul>
+                    </div>
+                )}
+                {storageError && <p className="text-[12px] text-[#fbbf24]">{storageError}</p>}
                 <div className="grid grid-cols-[1fr_auto] max-md:grid-cols-1 gap-4">
                     <label className={labelClass}>
                         音频（必填）
@@ -247,7 +380,7 @@ export const CustomSongPopup: React.FC<CustomSongPopupProps> = ({ isOpen, onClos
                         />
                         <span className="text-[12px] font-normal text-slate-500">
                             {isAnalyzing ? '正在分析节奏…' : analysis
-                                ? `时长 ${Math.floor(analysis.duration / 60)}:${String(Math.floor(analysis.duration % 60)).padStart(2, '0')} · 检测到 BPM ${analysis.bpm}`
+                                ? `${audioFile ? `${audioFile.name} · ` : ''}时长 ${Math.floor(analysis.duration / 60)}:${String(Math.floor(analysis.duration % 60)).padStart(2, '0')} · 检测到 BPM ${analysis.bpm}`
                                 : '支持浏览器能解码的格式（OGG、MP3、WAV、M4A、FLAC 等）。'}
                             {audioFile && !keepsOriginalAudio && ' · 导出时转为 OGG（和原游戏的音乐相同的格式）'}
                         </span>
@@ -405,6 +538,9 @@ export const CustomSongPopup: React.FC<CustomSongPopupProps> = ({ isOpen, onClos
                     ms
                 </label>
                 <div className="flex items-center gap-2">
+                    <Button variant="outline" size="md" title="把音频、曲绘和以上设置保存在这个浏览器里，下次打开网站可以直接打开" onClick={handleSave} disabled={!audioFile || !analysis || saving || upToDate}>
+                        {saving ? '保存中…' : upToDate ? '已保存' : savedId ? '保存修改' : '保存'}
+                    </Button>
                     <Button variant="outline" size="md" title={`导出为 ${formatLabel}`} onClick={handleExport} disabled={!generated || isExporting || generated.stats.total === 0}>
                         {convertProgress !== null ? `转换音频 ${Math.round(convertProgress * 100)}%` : isExporting ? `导出中 ${Math.round(exportProgress ?? 0)}%` : '导出 PEZ'}
                     </Button>
