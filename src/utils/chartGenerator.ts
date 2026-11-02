@@ -440,13 +440,12 @@ const SCREEN_HEIGHT = (18 * 9) / 16;
 const SAFE_X = 0.45 * SCREEN_WIDTH;
 const SAFE_Y = 0.45 * SCREEN_HEIGHT;
 // notes are 1.8 units wide. within CLOSE_SECONDS of each other two notes are either a clean repeat
-// (exactly the same spot, at least REPEAT_SECONDS apart) or at least NOTE_GAP apart, never half on
-// top of each other
+// (exactly the same spot, struck again by the same finger once it can tap again: profile.sameHand) or at
+// least NOTE_GAP apart, never half on top of each other
 const NOTE_GAP = 2;
 const CLOSE_SECONDS = 0.4;
 // note times are rounded to 1/32 beat on export (up to ~8 ms on fast songs): checks keep this margin
 const ROUNDING_MARGIN = 0.02;
-const REPEAT_SECONDS = 0.25;
 // drag streams glide note to note within this gap
 const GLIDE_SECONDS = 0.3;
 // a note this long before a rest ends a phrase
@@ -461,6 +460,8 @@ const CENTER_REACH = 1.5;
 const HAND_MEMORY = 0.8;
 // fingers of one hand used within this many seconds keep it in shape (within FingeringProfile.span)
 const SPAN_MEMORY = 0.5;
+// notes closer than this make a quick run, which keeps one figure (repeat, staircase, zigzag)
+const RUN_SECONDS = 0.35;
 // notes closer than this go hand to hand even when one hand could play both
 const ALTERNATE_SECONDS = 0.3;
 const SILENCE = 0.04;
@@ -732,6 +733,52 @@ export const generateChart = (analysis: AudioAnalysis, options: GeneratorOptions
         picked.push(slot);
     }
     picked.sort((a, b) => a - b);
+
+    // repeated music gets a repeated rhythm, as official charters write it (a fifth of their bars take the
+    // rhythm of a recent bar, a tenth its whole shape): a bar that sounds like one of the last eight (their
+    // placement scores line up) takes that bar's notes in time, where they fit the minimum gap
+    {
+        const slotsPerBar = 4 * sub;
+        const barCount = Math.ceil(slotCount / slotsPerBar);
+        const pickedSet = new Set(picked);
+        const scoresOf = (b: number) => Array.from({ length: slotsPerBar }, (_, k) => scores[b * slotsPerBar + k] ?? 0);
+        const cosine = (a: number[], b: number[]) => {
+            let dot = 0;
+            let na = 0;
+            let nb = 0;
+            for (let k = 0; k < a.length; k++) {
+                dot += a[k] * b[k];
+                na += a[k] * a[k];
+                nb += b[k] * b[k];
+            }
+            return na && nb ? dot / Math.sqrt(na * nb) : 0;
+        };
+        const inBar = (b: number) => [...pickedSet].filter(slot => slot >= b * slotsPerBar && slot < (b + 1) * slotsPerBar).sort((x, y) => x - y);
+        const total = (values: number[]) => values.reduce((sum, v) => sum + v, 0);
+        for (let b = 1; b < barCount; b++) {
+            const mine = scoresOf(b);
+            const own = inBar(b).length;
+            for (let e = b - 1; e >= Math.max(0, b - 8); e--) {
+                const model = inBar(e);
+                // the same music: its scores line up, it is about as loud, and the bar had about as many notes
+                // (so an echo never thins out a busy bar or crowds a quiet one)
+                const theirs = scoresOf(e);
+                const loudness = total(mine) / Math.max(1e-9, total(theirs));
+                if (model.length < 3 || Math.abs(model.length - own) > Math.max(1, 0.2 * own)
+                    || loudness < 0.8 || loudness > 1.25 || cosine(mine, theirs) < 0.9) continue;
+                for (const slot of inBar(b)) pickedSet.delete(slot);
+                for (const slot of model.map(m => m + (b - e) * slotsPerBar)) {
+                    if (slot >= slotCount || !active[slot]) continue;
+                    let free = true;
+                    for (let s = slot - gapSlots + 1; s < slot + gapSlots && free; s++) if (s !== slot && pickedSet.has(s)) free = false;
+                    if (free) pickedSet.add(slot);
+                }
+                break;
+            }
+        }
+        picked.length = 0;
+        picked.push(...[...pickedSet].sort((a, b) => a - b));
+    }
 
     // pitch: median over the frames just after the attack, where the tone has settled
     const settledPitch = (slot: number) => {
@@ -1069,7 +1116,7 @@ export const generateChart = (analysis: AudioAnalysis, options: GeneratorOptions
         // positions are rounded to 0.01 afterwards, which must not bring them under NOTE_GAP
         if (apart >= GAP) return true;
         // a clean repeat: same spot on the same line, far enough apart in time, and not on a hold still being held
-        return other.line === f.line && apart < 0.05 && other.type !== 3 && other.end <= time && time - other.time >= REPEAT_SECONDS;
+        return other.line === f.line && apart < 0.05 && other.type !== 3 && other.end <= time && time - other.time >= profile.sameHand;
     };
     /** taps and holds keep clear of a flick just before them, which its swipe would otherwise catch */
     const clearOfFlicks = (type: OfficialNote['type'], q: Point, time: number) => (type !== 1 && type !== 3)
@@ -1087,8 +1134,13 @@ export const generateChart = (analysis: AudioAnalysis, options: GeneratorOptions
         }
         return null;
     };
-    /** where the melody puts a note for hand `h` on `f`: by pitch inside the hand's half, moved by the step from its last note */
-    const melodicP = (h: number, note: PlannedNote, f: Frame, time: number) => {
+    /**
+     * Where a note for hand `h` on `f` is wanted: across the screen at `wantX` when a figure asks for a place,
+     * otherwise where the melody puts it (by pitch inside the hand's half, moved by the step from its last note).
+     */
+    const melodicP = (h: number, note: PlannedNote, f: Frame, time: number, wantX: number | null, wantAlong: { line: number; p: number } | null) => {
+        // an echoed bar repeats its shape along the line (the line moves; players read the shape on it)
+        if (wantAlong && wantAlong.line === f.line) return wantAlong.p;
         const hand = hands[h];
         const idle = idleFor(h, time);
         const contour = idle < 1.5 && Number.isFinite(hand.pitch) ? clamp((note.pitch - hand.pitch) * 6, -3, 3) : null;
@@ -1098,6 +1150,7 @@ export const generateChart = (analysis: AudioAnalysis, options: GeneratorOptions
             const [from, to] = h === 0 ? [-profile.spread, -1] : [1, profile.spread];
             let x = from + (to - from) * Math.min(1, pitchRank(note.pitch));
             if (contour !== null) x = 0.5 * x + 0.5 * (hand.at.x + contour);
+            if (wantX !== null) x = wantX;
             p = (x - f.cx) / f.ux;
         } else {
             // a steep line: high notes higher up it
@@ -1107,7 +1160,7 @@ export const generateChart = (analysis: AudioAnalysis, options: GeneratorOptions
         }
         const sameLine = hand.line === f.line;
         // the same tone again from the same hand is a clean repeat on the same spot
-        if (sameLine && idle >= REPEAT_SECONDS && idle < 0.4 && hand.type !== 3 && Math.abs(note.pitch - hand.pitch) < SEMITONE / 2) p = hand.p;
+        if (sameLine && idle >= profile.sameHand && idle < 0.4 && hand.type !== 3 && Math.abs(note.pitch - hand.pitch) < SEMITONE / 2) p = hand.p;
         // drag strings glide from drag to drag instead of jumping
         if (glides(h, note.type, time)) {
             const from = sameLine ? hand.p : project(f, hand.at);
@@ -1129,9 +1182,89 @@ export const generateChart = (analysis: AudioAnalysis, options: GeneratorOptions
         return q;
     };
 
+    // figures, the way official charters write them (measured on 36 official IN/AT charts): quick runs repeat a
+    // spot (14%), climb a staircase (12%) or zigzag (12%); two-note chords often mirror about the centre (36%);
+    // a bar may repeat the shape of a recent bar with the same rhythm, exactly (6.5% of bars) or mirrored (4%);
+    // and notes sit on whole units (39%), halves or quarters. a figure only says where a note is wanted: the
+    // hands still decide where it can go
+    interface Figure { kind: 'repeat' | 'stair' | 'zigzag' | 'free'; step: number; count: number }
+    let figure: Figure | null = null;
+    let lastX = 0;
+    const barSlots = 4 * sub;
+    const rhythmOf = new Map<number, string>();
+    for (const n of notes) {
+        const bar = Math.floor(n.slot / barSlots);
+        rhythmOf.set(bar, (rhythmOf.get(bar) ?? '') + `${n.slot - bar * barSlots},`);
+    }
+    const shapes: { bar: number; rhythm: string; xs: (number | null)[]; along: { line: number; p: number }[]; hands: number[] }[] = [];
+    let shape: (typeof shapes)[number] | null = null;
+    let echo: { xs: (number | null)[]; along: { line: number; p: number }[]; hands: number[]; mirror: boolean } | null = null;
+    /** grid a placed note snaps to (positionX units; 0: free), in official proportions */
+    const gridFor = () => {
+        const r = random();
+        if (profile.grid) return r < 0.6 ? 1 : 0.5;
+        // aimed above the official shares, since a snapped spot is only taken when the hands allow it
+        return r < 0.55 ? 1 : r < 0.63 ? 0.5 : r < 0.75 ? 0.25 : 0;
+    };
+
     for (const note of notes) {
         const time = slotTime(note.slot);
         const neighbours = placed.filter(other => time - other.time < CLOSE_SECONDS + ROUNDING_MARGIN || other.end > time);
+
+        // a new bar: keep the last one's shape, and maybe echo a recent bar with the same rhythm
+        const bar = Math.floor(note.slot / barSlots);
+        if (!shape || shape.bar !== bar) {
+            if (shape && shape.xs.length >= 3) shapes.push(shape);
+            const rhythm = rhythmOf.get(bar) ?? '';
+            shape = { bar, rhythm, xs: [], along: [], hands: [] };
+            // the same rhythm, or nearly (onset detection seldom gives a repeated bar exactly the same notes)
+            const slotsOf = (r: string) => new Set(r.split(',').filter(Boolean));
+            const mine = slotsOf(rhythm);
+            const alike = (other: string) => {
+                const theirs = slotsOf(other);
+                const shared = [...mine].filter(slot => theirs.has(slot)).length;
+                return shared / Math.max(mine.size, theirs.size) >= 0.75;
+            };
+            const earlier = shapes.slice(-8).reverse().find(s => s.bar < bar && alike(s.rhythm));
+            echo = earlier && random() < 0.55 ? { xs: earlier.xs, along: earlier.along, hands: earlier.hands, mirror: random() < 0.4 } : null;
+        }
+        const index = shape.xs.length;
+        let wantX: number | null = null;
+        let wantHand: number | null = null;
+        let wantAlong: { line: number; p: number } | null = null;
+        if (echo && index < echo.xs.length && echo.xs[index] !== null) {
+            wantX = echo.mirror ? -echo.xs[index]! : echo.xs[index];
+            wantAlong = { line: echo.along[index].line, p: echo.mirror ? -echo.along[index].p : echo.along[index].p };
+            wantHand = echo.mirror ? 1 - echo.hands[index] : echo.hands[index];
+        } else if (lastHand >= 0 && time - lastTime < RUN_SECONDS) {
+            // a quick run keeps one figure: start it on the run's second note
+            if (!figure) {
+                const r = random();
+                const up = note.pitch >= lastPitch ? 1 : -1;
+                figure = r < 0.14 ? { kind: 'repeat', step: 0, count: 0 }
+                    : r < 0.26 ? { kind: 'stair', step: up * (random() < 0.5 ? 2 : 2.5), count: 0 }
+                        : r < 0.38 ? { kind: 'zigzag', step: random() < 0.5 ? 2 : 3, count: 0 }
+                            : { kind: 'free', step: 0, count: 0 };
+            }
+            figure.count++;
+            if (figure.kind === 'repeat') {
+                wantX = lastX;
+                wantHand = lastHand;
+            } else if (figure.kind === 'stair') {
+                // a staircase is one hand stepping along its own half (alternating hands would have to cross),
+                // turning back at its edge
+                const [from, to] = lastHand === 0 ? [-profile.spread, CENTER_REACH] : [-CENTER_REACH, profile.spread];
+                if (lastX + figure.step < from || lastX + figure.step > to) figure.step = -figure.step;
+                wantX = lastX + figure.step;
+                wantHand = lastHand;
+            } else if (figure.kind === 'zigzag') {
+                wantX = lastX + (figure.count % 2 ? figure.step : -figure.step);
+            }
+        } else {
+            figure = null;
+        }
+        // figures land on the half-unit grid, so their steps stay even
+        if (wantX !== null) wantX = Math.round(wantX * 2) / 2;
 
         let playable = [0, 1].filter(h => canPlay(h, note.type, time));
         // too quick for every finger: a light hit becomes a drag a free finger just slides onto
@@ -1161,7 +1294,7 @@ export const generateChart = (analysis: AudioAnalysis, options: GeneratorOptions
             // keep both hands working
             return byPitch === lastHand && sameHandRun >= 4 ? 1 - lastHand : byPitch;
         };
-        const preferred = preferHand();
+        const preferred = wantHand !== null && playable.includes(wantHand) ? wantHand : preferHand();
         const holdEnd = note.type === 3 ? slotTime(note.slot + note.holdSlots) : time;
         const search = (candidates: number[]): { hand: number; f: Frame; p: number } | null => {
             const order = candidates.includes(preferred) ? [preferred, ...candidates.filter(h => h !== preferred)] : candidates;
@@ -1178,10 +1311,13 @@ export const generateChart = (analysis: AudioAnalysis, options: GeneratorOptions
                     return handAllows(h, q, f, time) && blocking.every(other => clearOf(other, f, p, q, time))
                         && taken.every(c => distance(c.at, q) >= GAP) && clearOfFlicks(note.type, q, time);
                 };
-                let spot = findSpot(melodicP(h, note, f, time), low, high, ok);
+                let spot = findSpot(melodicP(h, note, f, time, wantX, wantAlong), low, high, ok);
                 if (spot === null) continue;
-                if (profile.grid && f.line < 0) {
-                    const snapped = Math.round(spot / profile.grid) * profile.grid;
+                // official charts sit their notes on a grid (whole units most of all) where they can; a figure's
+                // spot is kept as it is, so its steps stay even
+                const grid = Math.abs(f.ux) >= 0.5 && wantX === null ? gridFor() : 0;
+                if (grid) {
+                    const snapped = Math.round(spot / grid) * grid;
                     if (snapped >= low && snapped <= high && ok(snapped)) spot = snapped;
                 }
                 // a repeat lands exactly on the earlier note, not a hair beside it
@@ -1229,7 +1365,15 @@ export const generateChart = (analysis: AudioAnalysis, options: GeneratorOptions
                 const pf = frameFor(other, time, time);
                 const [low, high] = handRange(other, pf, time);
                 const ok = clearSpot(other, pf);
-                const p = findSpot(towards(pf, (other === 1 ? 1 : -1) * (4 + random() * 4)), low, high, x => ok(x) && distance(pointAt(pf, x), q) >= 3.5);
+                const accepts = (x: number) => ok(x) && distance(pointAt(pf, x), q) >= 3.5;
+                // a third of official chords mirror about the centre of the screen
+                // (along the line when both notes are on it, since the line itself may be off-centre)
+                const mirrored = Math.abs(pf.ux) >= 0.5 && Math.abs(found.p) >= 1.75 && random() < 0.75
+                    ? (pf.line === f.line ? -found.p : (-q.x - pf.cx) / pf.ux)
+                    : null;
+                const p = mirrored !== null && mirrored >= low && mirrored <= high && accepts(mirrored)
+                    ? mirrored
+                    : findSpot(towards(pf, (other === 1 ? 1 : -1) * (4 + random() * 4)), low, high, accepts);
                 if (p !== null) partner = { hand: other, f: pf, p };
             }
             if (!partner && style.fingers > 1 && busyFingers(hand, partnerType, time).length + 1 < style.fingers) {
@@ -1274,6 +1418,10 @@ export const generateChart = (analysis: AudioAnalysis, options: GeneratorOptions
                 break;
             }
         }
+        shape.xs.push(Math.abs(f.ux) >= 0.5 ? q.x : null);
+        shape.along.push({ line: f.line, p: note.x });
+        shape.hands.push(hand);
+        lastX = q.x;
         sameHandRun = hand === lastHand ? sameHandRun + 1 : 1;
         lastHand = hand;
         lastTime = time;
@@ -1324,7 +1472,7 @@ export const generateChart = (analysis: AudioAnalysis, options: GeneratorOptions
             if (gap < CLOSE_SECONDS + ROUNDING_MARGIN || endOf(kept[k]) > time) near.push(kept[k]);
         }
         const canRepeat = (other: PlannedNote) => other.type !== 3 && endOf(other) <= time
-            && time - slotTime(other.slot) >= REPEAT_SECONDS - 0.001;
+            && time - slotTime(other.slot) >= profile.sameHand - 0.001;
         const apart = (other: PlannedNote) => (other.line === note.line ? Math.abs(note.x - other.x) : Math.hypot(note.sx - other.sx, note.sy - other.sy));
         const clear = (other: PlannedNote) => {
             const d = apart(other);

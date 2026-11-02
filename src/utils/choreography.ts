@@ -48,6 +48,10 @@ export interface Choreography {
 const COVERAGE: Record<GeneratorDifficulty, number> = { EZ: 0.25, HD: 0.4, IN: 0.55, AT: 0.62 };
 const MAX_LINES = 4;
 const CARRIES_NOTES: Motif[] = ['relay', 'split', 'stack'];
+// a line that is only performing stays faint (the playing lines are drawn at full strength), so it is never
+// mistaken for one to hit; official charts keep note-less lines at a mean opacity of 0.61, 35% of the time
+// under 0.5
+const DECOR_ALPHA = 0.45;
 /** part of a relay (0..1) during which its line has arrived and carries the notes */
 const RELAY_FROM = 0.18;
 const RELAY_TO = 0.86;
@@ -297,12 +301,19 @@ export const buildChoreography = (options: {
     const lineCount = performances.reduce((m, p) => Math.max(m, p.lines), 0);
     const active = (time: number) => performances.find(p => time >= p.start && time < p.end) ?? null;
 
+    /** how strongly a performance's line is drawn: full while it carries notes, faint otherwise */
+    const strength = (perf: Performance, p: number) => {
+        if (!CARRIES_NOTES.includes(perf.motif) || options.difficulty === 'EZ') return DECOR_ALPHA;
+        const [from, to] = perf.motif === 'relay' ? [RELAY_FROM, RELAY_TO] : [0.26, 0.74];
+        const carrying = Math.min(smooth((p - from + 0.06) / 0.06), smooth((to + 0.06 - p) / 0.06));
+        return DECOR_ALPHA + (1 - DECOR_ALPHA) * carrying;
+    };
     const poseAt = (index: number, time: number, main: LinePose): LinePose => {
         const perf = active(time);
         if (!perf || index >= perf.lines) return { x: main.x, y: main.y, angle: main.angle, alpha: 0 };
         const p = (time - perf.start) / (perf.end - perf.start);
         const pose = motifPose(perf, index, p, (time - perf.start) / beat, main);
-        return { ...pose, alpha: clamp(pose.alpha, 0, 1) * main.alpha };
+        return { ...pose, alpha: clamp(pose.alpha, 0, 1) * strength(perf, p) * main.alpha };
     };
 
     // a relay line takes every note of its phrase once it has arrived (a hold must end before it leaves).
