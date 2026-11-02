@@ -9,6 +9,7 @@ import { encodeWav } from '../utils/wav';
 import { encodeOgg } from '../utils/oggEncode';
 import type { BarState } from '../utils/lineMotion';
 import type { Motif } from '../utils/choreography';
+import FileSaver from 'file-saver';
 import { SavedSongSummary, deleteSavedSong, listSavedSongs, loadSavedSong, newSongId, saveSong } from '../utils/customSongStore';
 import {
     AudioAnalysis,
@@ -125,6 +126,19 @@ export const CustomSongPopup: React.FC<CustomSongPopupProps> = ({ isOpen, onClos
     /** settings as last saved or opened, to tell whether there is anything new to save */
     const [savedSnapshot, setSavedSnapshot] = useState<string | null>(null);
     const [storageError, setStorageError] = useState<string | null>(null);
+    const [skinState, setSkinState] = useState<'idle' | 'building' | 'failed'>('idle');
+    const downloadSkin = async () => {
+        setSkinState('building');
+        try {
+            // loaded on demand: it brings the zip library along
+            const { buildPhiraSkin } = await import('../utils/phiraSkin');
+            FileSaver.saveAs(await buildPhiraSkin(), 'Phigros-Style-Phira-Skin.zip');
+            setSkinState('idle');
+        } catch (e) {
+            console.error(e);
+            setSkinState('failed');
+        }
+    };
     const refreshSaved = () => listSavedSongs().then(setSavedSongs).catch(() => setStorageError('这个浏览器无法保存歌曲（可能处于无痕模式或禁用了网站数据）。'));
     useEffect(() => {
         if (isOpen) refreshSaved();
@@ -522,6 +536,16 @@ export const CustomSongPopup: React.FC<CustomSongPopupProps> = ({ isOpen, onClos
                     高潮的动法由歌曲本身的明亮度、密度和旋律起伏混合而成。物量和各种键的比例参照官方同难度谱面的中位数；定数由官方 516 张谱面拟合的公式自动评出（平均误差约 ±1）。
                     如果试听时打击音和节拍对不上，请修改 BPM 或偏移（正数让音符更晚出现）。导出格式与原程序一致，遵循设置里的「ZIP 格式」和「谱面格式转换」选项。
                 </p>
+
+                <div className="rounded-xl border border-white/[.08] bg-white/[.02] px-4 py-3 flex flex-wrap items-center justify-between gap-3">
+                    <p className="text-[12px] leading-[1.6] text-slate-400 flex-1 min-w-[220px]">
+                        在 Phira 里，键的形状和打击动画由 Phira 的资源包决定，谱面改变不了。下载这个原作风格的资源包（全部用代码绘制，不含游戏素材），
+                        在 Phira 的「设置 → 资源包」里导入一次，之后所有谱面都会用原作风格的键型和打击动画。
+                    </p>
+                    <Button variant="outline" onClick={downloadSkin} disabled={skinState === 'building'}>
+                        {skinState === 'building' ? '生成中…' : skinState === 'failed' ? '生成失败，重试' : '下载 Phira 皮肤'}
+                    </Button>
+                </div>
 
                 {error && <p className="text-[13px] text-[#f87171]">{error}</p>}
             </div>
