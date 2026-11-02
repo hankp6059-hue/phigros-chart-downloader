@@ -4,14 +4,16 @@
 // and how they move come from the song itself (its sections, its character, its accents) and from a seed of
 // the song, so every song is staged differently and the same song always the same way.
 //
-// most notes stay on the main line, as in official charts (it carries about three quarters); an extra line only
-// carries notes while it runs parallel to the main line at the same x and angle, so a note's position across
-// the screen (and with it the fingering) is unchanged
+// most notes stay on the main line, as in official charts (it carries about three quarters). of the rest, two
+// thirds come in relays (another line takes over a phrase while the main line rests) and a third while the
+// main line plays too; mostly on near-level lines (69%), some tilted (16%) or upright (15%), often moving.
+// here relay lines (level, tilted or upright) and split lines carry notes; the generator places those notes
+// with its two-dimensional hand model, so they stay comfortable to play wherever the line is
 
 import type { GeneratorDifficulty } from './chartGenerator';
 import type { BarMood, BarState, LinePose } from './lineMotion';
 
-export type Motif = 'split' | 'stack' | 'fan' | 'cross' | 'orbit' | 'sweep' | 'flyIn' | 'mirror' | 'pendulum' | 'converge' | 'shatter' | 'pulse';
+export type Motif = 'relay' | 'split' | 'stack' | 'fan' | 'cross' | 'orbit' | 'sweep' | 'flyIn' | 'mirror' | 'pendulum' | 'converge' | 'shatter' | 'pulse';
 
 export interface Performance {
     motif: Motif;
@@ -24,6 +26,8 @@ export interface Performance {
     direction: number;
     /** 0..1: how big it is */
     size: number;
+    /** a relay on an upright line at the side of the screen (notes then come in sideways) */
+    upright?: boolean;
 }
 
 export interface Choreography {
@@ -32,30 +36,37 @@ export interface Choreography {
     lineCount: number;
     /** pose of extra line `index` (0-based) at `time`, given the main line's pose then */
     poseAt: (index: number, time: number, main: LinePose) => LinePose;
-    /** extra line (0-based) a note at `time` (held until `end`) at position `x` rides, or -1 for the main line */
-    noteLine: (time: number, end: number, x: number) => number;
+    /** extra line (0-based) a note at `time` (held until `end`) played by the hand on `side` (-1 left, 1 right) rides, or -1 for the main line */
+    noteLine: (time: number, end: number, side: number) => number;
+    /** how visible the main line is at `time` (it dims while a relay line plays) */
+    mainAlphaAt: (time: number) => number;
 }
+
 
 // how much of the playing time has performances. 36 official IN/AT charts show two or more lines 62% of the
 // time (four or more 22%), with the main line carrying a median 74% of the notes; easier charts stage less
 const COVERAGE: Record<GeneratorDifficulty, number> = { EZ: 0.25, HD: 0.4, IN: 0.55, AT: 0.62 };
 const MAX_LINES = 4;
-const CARRIES_NOTES: Motif[] = ['split', 'stack'];
+const CARRIES_NOTES: Motif[] = ['relay', 'split', 'stack'];
+/** part of a relay (0..1) during which its line has arrived and carries the notes */
+const RELAY_FROM = 0.18;
+const RELAY_TO = 0.86;
 
 /** motifs that suit each kind of section */
 const BY_STATE: Record<BarState | 'intro' | 'outro', Motif[]> = {
     intro: ['flyIn', 'converge', 'fan', 'orbit', 'stack'],
     silent: ['pulse', 'orbit'],
-    calm: ['pulse', 'mirror', 'pendulum', 'orbit', 'stack'],
-    groove: ['split', 'mirror', 'cross', 'pendulum', 'sweep', 'fan', 'stack'],
-    build: ['converge', 'stack', 'orbit', 'pulse'],
+    calm: ['relay', 'pulse', 'mirror', 'pendulum', 'orbit', 'stack'],
+    groove: ['relay', 'split', 'mirror', 'cross', 'pendulum', 'sweep', 'fan', 'stack'],
+    build: ['relay', 'converge', 'stack', 'orbit', 'pulse'],
     drop: ['shatter', 'fan', 'cross', 'split'],
-    climax: ['split', 'cross', 'orbit', 'sweep', 'fan', 'shatter', 'stack'],
+    climax: ['relay', 'split', 'cross', 'orbit', 'sweep', 'fan', 'shatter', 'stack'],
     outro: ['converge', 'fan', 'orbit', 'pulse'],
 };
 
 /** which of the song's characters (from the line motion) each motif suits */
 const CHARACTER: Record<Motif, { bounce: number; pendulum: number; wave: number }> = {
+    relay: { bounce: 0.8, pendulum: 0.8, wave: 0.8 },
     split: { bounce: 1, pendulum: 0.3, wave: 0.4 },
     stack: { bounce: 1, pendulum: 0.2, wave: 0.3 },
     shatter: { bounce: 1, pendulum: 0.4, wave: 0.2 },
@@ -71,7 +82,7 @@ const CHARACTER: Record<Motif, { bounce: number; pendulum: number; wave: number 
 };
 
 const LINES: Record<Motif, [number, number]> = {
-    split: [1, 2], stack: [2, 3], fan: [2, 4], cross: [2, 2], orbit: [2, 4], sweep: [1, 2],
+    relay: [1, 1], split: [1, 2], stack: [2, 3], fan: [2, 4], cross: [2, 2], orbit: [2, 4], sweep: [1, 2],
     flyIn: [2, 4], mirror: [1, 1], pendulum: [1, 2], converge: [2, 4], shatter: [3, 4], pulse: [2, 3],
 };
 
@@ -102,10 +113,24 @@ const motifPose = (perf: Performance, k: number, p: number, beats: number, main:
     const env = envelope(p);
     const spread = (k + 1) / n;
     switch (perf.motif) {
+        case 'relay': {
+            // a line flies in from the side, settles higher up and a little tilted (or upright at one side),
+            // drifts while it plays the phrase, and flies out the other way
+            const restX = perf.upright ? 0.5 + d * 0.22 : 0.5 + d * 0.06;
+            const restY = perf.upright ? 0.5 : 0.5 + 0.18 * size;
+            const tilt = perf.upright ? d * (72 + 18 * size) : d * (6 + 14 * size);
+            const enter = easeOut(p / RELAY_FROM);
+            const leave = smooth((p - RELAY_TO) / (1 - RELAY_TO));
+            const x = restX - d * 0.9 * (1 - enter) + d * 0.9 * leave;
+            const drift = Math.sin(Math.PI * Math.min(1, Math.max(0, (p - RELAY_FROM) / (RELAY_TO - RELAY_FROM))));
+            return { x, y: restY + 0.03 * drift, angle: tilt - d * 5 * drift, alpha: Math.min(enter, 1 - leave) };
+        }
         case 'split': {
-            // parallel copies peel off the main line, ride along with it, and fold back in
+            // copies peel off the main line, tilting a little apart, ride along with it, and fold back in
+            const out = smooth(Math.min(p / 0.25, (1 - p) / 0.25));
             const gap = (0.1 + 0.08 * size) * (k + 1) * d;
-            return { x: main.x, y: main.y + gap * smooth(Math.min(p / 0.25, (1 - p) / 0.25)), angle: main.angle, alpha: env };
+            const tilt = (k % 2 ? -1 : 1) * d * (3 + 9 * size) * out;
+            return { x: main.x, y: main.y + gap * out, angle: main.angle + tilt, alpha: env };
         }
         case 'stack': {
             // one parallel line more on each beat, then all of them leave together
@@ -193,8 +218,11 @@ export const buildChoreography = (options: {
     // the parallel motifs carry notes, so harder charts (whose official counterparts put a quarter of their
     // notes on other lines) favour them
     const carrying = { EZ: 1, HD: 1.3, IN: 1.7, AT: 1.9 }[options.difficulty];
+    // relays above all: two thirds of official off-main notes come in them (another line plays most of 23% of
+    // all 4 s stretches)
+    const relaying = { EZ: 1, HD: 1.8, IN: 2.6, AT: 2.8 }[options.difficulty];
     const pick = (pool: Motif[], avoid: Motif[]) => {
-        const weights = pool.map(m => (avoid.includes(m) ? 0.05 : 1) * (CARRIES_NOTES.includes(m) ? carrying : 1)
+        const weights = pool.map(m => (avoid.includes(m) ? 0.05 : 1) * (m === 'relay' ? relaying : CARRIES_NOTES.includes(m) ? carrying : 1)
             * (CHARACTER[m].bounce * character.bounce + CHARACTER[m].pendulum * character.pendulum + CHARACTER[m].wave * character.wave) * (0.5 + random()));
         let r = random() * weights.reduce((s, w) => s + w, 0);
         for (let i = 0; i < pool.length; i++) {
@@ -205,7 +233,10 @@ export const buildChoreography = (options: {
     };
     const make = (motif: Motif, start: number, end: number, intensity: number): Performance => {
         const [lo, hi] = LINES[motif];
-        return { motif, start, end, lines: Math.min(MAX_LINES, lo + Math.round(random() * (hi - lo))), direction: random() < 0.5 ? -1 : 1, size: clamp(0.3 + 0.6 * intensity + 0.2 * (random() - 0.5), 0, 1) };
+        const perf: Performance = { motif, start, end, lines: Math.min(MAX_LINES, lo + Math.round(random() * (hi - lo))), direction: random() < 0.5 ? -1 : 1, size: clamp(0.3 + 0.6 * intensity + 0.2 * (random() - 0.5), 0, 1) };
+        // official charts put 15% of their off-main notes on upright lines; relays carry most of ours
+        if (motif === 'relay') perf.upright = random() < 0.3;
+        return perf;
     };
 
     // intro: lines gather before the first note (up to two bars of it)
@@ -240,8 +271,9 @@ export const buildChoreography = (options: {
         const record = { index, state: section.state, intensity: section.intensity, bars: length, motifs: [] as Motif[], directions: [] as number[] };
         const duration = section.state === 'build' ? Math.min(end - start, 4 * barSeconds) : section.state === 'drop' ? barSeconds : (length <= 2 ? 1 : 2) * barSeconds;
         for (let s = start, k = 0; s < end - 2 * beat && budget > 0; k++) {
-            const e = Math.min(s + duration, end);
             const motif = repeat?.motifs[k] ?? pick(BY_STATE[section.state], recent);
+            // a relay plays a whole phrase, three or four bars, even past the end of its section
+            const e = motif === 'relay' ? Math.min(s + (3 + Math.floor(random() * 2)) * barSeconds, last) : Math.min(s + duration, end);
             const perf = make(motif, s, e, section.intensity);
             if (repeat?.directions[k]) perf.direction = -repeat.directions[k];
             if (!performances.some(p => s < p.end + beat / 2 && e > p.start - beat / 2)) {
@@ -273,20 +305,32 @@ export const buildChoreography = (options: {
         return { ...pose, alpha: clamp(pose.alpha, 0, 1) * main.alpha };
     };
 
-    // notes ride parallel extra lines in the middle of a split or a stack: right-hand notes on the first
-    // extra line, left-hand ones on the second (or the main line when there is none), so each hand reads one
-    // line; never on EZ
-    const noteLine = (time: number, end: number, x: number) => {
+    // a relay line takes every note of its phrase once it has arrived (a hold must end before it leaves).
+    // in a split or a stack, right-hand notes ride the first extra line and left-hand ones the second (or the
+    // main line when there is none), so each hand reads one line. never on EZ
+    const noteLine = (time: number, end: number, side: number) => {
         if (options.difficulty === 'EZ') return -1;
         const perf = active(time);
         if (!perf || !CARRIES_NOTES.includes(perf.motif)) return -1;
         const p = (time - perf.start) / (perf.end - perf.start);
+        if (perf.motif === 'relay') {
+            const pEnd = (end - perf.start) / (perf.end - perf.start);
+            return p >= RELAY_FROM + 0.02 && pEnd <= RELAY_TO - 0.02 ? 0 : -1;
+        }
         // the line is fully out from 0.25 to 0.75 of the performance; a hold must end while it still is
-        if (p < 0.3 || p > 0.7 || (end - perf.start) / (perf.end - perf.start) > 0.75) return -1;
+        if (p < 0.26 || p > 0.74 || (end - perf.start) / (perf.end - perf.start) > 0.75) return -1;
         // a stack shows its lines one beat after another
-        if (perf.motif === 'stack' && (time - perf.start) / beat < (x > 0 ? 1 : 2)) return -1;
-        return x > 0 ? 0 : perf.lines >= 2 ? 1 : -1;
+        if (perf.motif === 'stack' && (time - perf.start) / beat < (side > 0 ? 1 : 2)) return -1;
+        return side > 0 ? 0 : perf.lines >= 2 ? 1 : -1;
     };
 
-    return { performances, lineCount, poseAt, noteLine };
+    // the main line dims to a third while a relay line plays
+    const mainAlphaAt = (time: number) => {
+        const perf = active(time);
+        if (!perf || perf.motif !== 'relay') return 1;
+        const p = (time - perf.start) / (perf.end - perf.start);
+        return 1 - 0.7 * Math.min(smooth(p / RELAY_FROM), 1 - smooth((p - RELAY_TO) / (1 - RELAY_TO)));
+    };
+
+    return { performances, lineCount, poseAt, noteLine, mainAlphaAt };
 };
