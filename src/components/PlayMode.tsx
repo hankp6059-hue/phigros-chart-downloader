@@ -1,7 +1,10 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import type { OfficialChart } from '../utils/chartConverter';
-import { linePoseAt, noteMetrics, renderChart } from '../utils/chartRenderer';
+import {
+    BAD_FLASH_SECONDS, GOOD_COLOR, HIT_EFFECT_SECONDS, HOLD_EFFECT_INTERVAL, PERFECT_COLOR,
+    drawBadFlash, drawHitEffect, linePoseAt, noteMetrics, renderChart,
+} from '../utils/chartRenderer';
 import { Hit, Judgment, PlaySession } from '../utils/playJudge';
 import { DifficultyCard } from './DifficultyCard';
 import { unlockAudio } from '../utils/audioUnlock';
@@ -26,6 +29,10 @@ interface Effect {
     angle: number;
     born: number;
     color: string;
+    /** fixes the burst's spark directions */
+    seed: number;
+    /** a hit burst, or a Bad note's red ghost */
+    bad: boolean;
 }
 
 /** a finger on the screen, with Phira's flick tracking (prpr/src/judge.rs FlickTracker) */
@@ -45,10 +52,9 @@ interface Finger {
 // Phira's flick speed: FLICK_SPEED_THRESHOLD 0.8 at its reference dpi (275 / 386), in half screen widths per second
 const FLICK_SPEED = 0.8 * (275 / 386);
 
-const EFFECT_SECONDS = 0.35;
 // seconds counted down after resuming, during which the chart stays still
 const RESUME_COUNTDOWN = 3;
-const EFFECT_COLORS: Record<number, string> = { [Judgment.Perfect]: '#ffe17a', [Judgment.Good]: '#7dd3fc' };
+const EFFECT_COLORS: Record<number, string> = { [Judgment.Perfect]: PERFECT_COLOR, [Judgment.Good]: GOOD_COLOR };
 // the smoothed song clock snaps back to the audio clock when they drift further apart than this
 const CLOCK_RESYNC = 0.018;
 // how quickly (seconds) the smoothed clock eases onto the audio clock's average
@@ -81,6 +87,8 @@ export const PlayMode: React.FC<PlayModeProps> = ({ chart, audio, title, difficu
     const audioRef = useRef<{ context: AudioContext; startAt: number } | null>(null);
     const fingersRef = useRef(new Map<number, Finger>());
     const effectsRef = useRef<Effect[]>([]);
+    /** song time of each held hold's last burst */
+    const holdBurstsRef = useRef(new Map<number, number>());
     const frameRef = useRef(0);
     const clockRef = useRef<SongClock | null>(null);
     const fontsRef = useRef<{ sans: string; mono: string } | null>(null);
@@ -182,7 +190,10 @@ export const PlayMode: React.FC<PlayModeProps> = ({ chart, audio, title, difficu
                 y: pose.y - x * Math.sin(radians),
                 angle: pose.angle,
                 born: performance.now() / 1000,
-                color: EFFECT_COLORS[hit.judgment],
+                color: EFFECT_COLORS[hit.judgment] ?? PERFECT_COLOR,
+                // a hold's head and end bursts differ
+                seed: hit.index * 97 + (session.holding.has(hit.index) ? 0 : 61),
+                bad: hit.judgment === Judgment.Bad,
             });
         }
     }, [lines]);
@@ -213,34 +224,47 @@ export const PlayMode: React.FC<PlayModeProps> = ({ chart, audio, title, difficu
         }
         handleHits(session.update(time), time);
 
+        // a held hold throws a burst at its place on the line every HOLD_EFFECT_INTERVAL
+        const holdBursts = holdBurstsRef.current;
+        const { unit } = noteMetrics(canvas.width, canvas.height);
+        for (const i of holdBursts.keys()) if (!session.holding.has(i)) holdBursts.delete(i);
+        for (const [i, hold] of session.holding) {
+            const last = holdBursts.get(i);
+            // the head's own burst came with its hit
+            if (last === undefined) holdBursts.set(i, time);
+            else if (time - last >= HOLD_EFFECT_INTERVAL) {
+                const k = Math.floor((time - session.notes[i].time) / HOLD_EFFECT_INTERVAL);
+                holdBursts.set(i, time - last > HOLD_EFFECT_INTERVAL * 2 ? time : last + HOLD_EFFECT_INTERVAL);
+                const note = session.notes[i];
+                const pose = linePoseAt(lines[note.line], time, canvas.width, canvas.height);
+                const radians = (pose.angle * Math.PI) / 180;
+                const x = note.x * unit;
+                effectsRef.current.push({
+                    x: pose.x + x * Math.cos(radians),
+                    y: pose.y - x * Math.sin(radians),
+                    angle: pose.angle,
+                    born: performance.now() / 1000,
+                    color: hold.perfect ? PERFECT_COLOR : GOOD_COLOR,
+                    seed: i * 97 + k,
+                    bad: false,
+                });
+            }
+        }
+
         renderChart(g, chart, time, canvas.width, canvas.height, {
             cover: coverRef.current,
             isHidden: i => session.results[i] !== Judgment.Pending,
             isHolding: i => session.holding.has(i),
         });
 
-        // hit effects: a spinning square burst
+        // hit effects: Phigros-style square bursts, and a red flash for a Bad
         const now = performance.now() / 1000;
-        const size = canvas.height * 0.09;
-        effectsRef.current = effectsRef.current.filter(e => now - e.born < EFFECT_SECONDS);
+        const { noteWidth, noteHeight } = noteMetrics(canvas.width, canvas.height);
+        effectsRef.current = effectsRef.current.filter(e => now - e.born < (e.bad ? BAD_FLASH_SECONDS : HIT_EFFECT_SECONDS));
         for (const effect of effectsRef.current) {
-            const p = (now - effect.born) / EFFECT_SECONDS;
-            g.save();
-            g.translate(effect.x, effect.y);
-            g.rotate((-effect.angle * Math.PI) / 180 + p * Math.PI / 2);
-            g.globalAlpha = 1 - p;
-            g.strokeStyle = effect.color;
-            g.lineWidth = Math.max(2, canvas.height * 0.006);
-            const s = size * (0.5 + p);
-            g.strokeRect(-s / 2, -s / 2, s, s);
-            g.fillStyle = effect.color;
-            for (let k = 0; k < 4; k++) {
-                const a = (k * Math.PI) / 2 + Math.PI / 4;
-                g.fillRect(Math.cos(a) * s * 0.8 - 3, Math.sin(a) * s * 0.8 - 3, 6, 6);
-            }
-            g.restore();
+            if (effect.bad) drawBadFlash(g, effect.x, effect.y, effect.angle, now - effect.born, noteWidth, noteHeight);
+            else drawHitEffect(g, effect.x, effect.y, effect.angle, now - effect.born, effect.color, effect.seed, noteWidth);
         }
-        g.globalAlpha = 1;
 
         const finished = session.finished && time > lastEnd + 1;
 
@@ -286,7 +310,7 @@ export const PlayMode: React.FC<PlayModeProps> = ({ chart, audio, title, difficu
             return;
         }
         frameRef.current = requestAnimationFrame(frame);
-    }, [audio.duration, chart, handleHits, lastEnd, project, songTime]);
+    }, [audio.duration, chart, handleHits, lastEnd, lines, project, songTime]);
 
     // must run from a tap: iPad only lets audio start from a user gesture
     const start = () => {
@@ -304,6 +328,7 @@ export const PlayMode: React.FC<PlayModeProps> = ({ chart, audio, title, difficu
         sessionRef.current = new PlaySession(chart);
         fingersRef.current.clear();
         effectsRef.current = [];
+        holdBurstsRef.current.clear();
         clockRef.current = null;
         setSummary(null);
         setPhase('playing');
