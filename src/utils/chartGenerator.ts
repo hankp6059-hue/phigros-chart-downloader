@@ -56,6 +56,8 @@ export interface GeneratorOptions {
     speedChanges?: boolean;
     /** fingers per hand the chart is written for (default 'single') */
     fingering?: FingeringStyle;
+    /** 0 for the song's first staging of extra judgment lines; another number stages it anew (notes stay) */
+    stagingSeed?: number;
 }
 
 export interface GeneratedChart {
@@ -64,6 +66,8 @@ export interface GeneratedChart {
     motion?: LineMotion;
     /** performances of extra judgment lines (present with line motion) */
     choreography?: Choreography;
+    /** drag streams written where the music lifts */
+    streams: DragStream[];
     /** the hand (0 left, 1 right) planned for each note, per judgment line in the chart's note order */
     hands: number[][];
     /** difficulty constant on the official scale */
@@ -544,6 +548,22 @@ interface PlannedNote {
     triple?: boolean;
     /** type of the chord's other note (official chords mix types: drag with tap, flick with tap ...) */
     partnerType?: OfficialNote['type'];
+    /** where a drag stream's path wants this note across the screen, and the hand it is for */
+    sweepX?: number;
+    sweepHand?: number;
+}
+
+/** the path a drag stream's notes follow across the screen */
+export type StreamPath = 'cross' | 'converge' | 'arc' | 'wave';
+
+export interface DragStream {
+    /** 'runway': the run-up into a drop or a climax; 'fill': the end of a climax phrase into the next */
+    kind: 'runway' | 'fill';
+    path: StreamPath;
+    /** seconds */
+    start: number;
+    end: number;
+    notes: number;
 }
 
 /** Takes the best `rate` share of `candidates` (by score, highest first) that pass `accept`. */
@@ -931,6 +951,119 @@ export const generateChart = (analysis: AudioAnalysis, options: GeneratorOptions
             note.partnerType = type === 1 ? (r < 0.2 ? 2 : 1) : type === 2 ? (r < 0.55 ? 2 : 1) : type === 3 ? 1 : r < 0.6 ? 1 : 4;
         }
     }
+    // drag streams (yellow) where the music lifts, for the rush of a long slide landing on the beat: a run-up
+    // of drags through the bar before each drop (and before a climax that starts without one), landing on its
+    // downbeat with a flick, chorded above EZ; and in a climax, the last two beats of a phrase slide into the
+    // next phrase's downbeat. each stream follows one path across the screen: one sweep from side to side,
+    // both hands closing in on the centre, one hand arching in and out, or a wave
+    const moods = readBarMoods(analysis, options.bpm, firstBeat);
+    const streams: DragStream[] = [];
+    {
+        // stream notes come a sixteenth apart (an eighth on EZ and HD)
+        const step = options.difficulty === 'EZ' || options.difficulty === 'HD' ? Math.max(1, Math.round(sub / 2)) : Math.max(1, Math.round(sub / 4));
+        const edge = profile.spread - 0.5;
+        const slotOf = (time: number) => Math.round((time - firstBeat) / slotSeconds);
+        const lifted = (b: number) => moods[b]?.state === 'climax' || moods[b]?.state === 'drop';
+        const inStream = new Uint8Array(slotCount + 1);
+        const pathX = (path: StreamPath, u: number, i: number, dir: number, waves: number): [number, number] => {
+            switch (path) {
+                case 'cross': {
+                    const x = dir * (-edge + 2 * edge * u);
+                    return [x, x < 0 ? 0 : 1];
+                }
+                case 'converge': {
+                    // hands take turns, each closing in from its edge
+                    const side = i % 2 ? dir : -dir;
+                    return [side * (edge - (edge - 1.5) * u), side > 0 ? 1 : 0];
+                }
+                case 'arc':
+                    return [dir * (edge - (edge - 1) * Math.sin(Math.PI * u)), dir > 0 ? 1 : 0];
+                case 'wave':
+                default:
+                    return [dir * ((1 + edge) / 2 + ((edge - 1) / 2) * Math.sin(2 * Math.PI * waves * u)), dir > 0 ? 1 : 0];
+            }
+        };
+        const lay = (kind: DragStream['kind'], from: number, to: number, paths: StreamPath[]) => {
+            from = Math.max(0, from);
+            if (to > slotCount || to - from < 2 * step) return false;
+            for (let s = from; s <= to; s++) if (inStream[s]) return false;
+            // a hold reaching into the run keeps it from being one slide
+            if (notes.some(n => n.type === 3 && n.slot < from && n.slot + n.holdSlots > from)) return false;
+            // the slide stops a step before the downbeat, so the hands are up again to hit it together
+            const stop = to - step;
+            const slots = new Set<number>();
+            for (let s = from; s < stop; s += step) if (active[s]) slots.add(s);
+            for (const n of notes) if (n.slot >= from && n.slot < stop) slots.add(n.slot);
+            const ordered = [...slots].sort((a, b) => a - b);
+            // too little sounding there for a stream
+            if (ordered.length < 4) return false;
+            for (let k = notes.length - 1; k >= 0; k--) if (notes[k].slot >= stop && notes[k].slot < to) notes.splice(k, 1);
+            const bySlot = new Map(notes.map(n => [n.slot, n]));
+            const stream = ordered.map(slot => {
+                let note = bySlot.get(slot);
+                if (!note) {
+                    note = { slot, strength: strengths[slot], pitch: settledPitch(slot), type: 2, holdSlots: 0, x: 0, line: -1, sx: 0, sy: 0, chord: false };
+                    notes.push(note);
+                }
+                note.type = 2;
+                note.holdSlots = 0;
+                note.chord = false;
+                note.triple = false;
+                note.partnerType = undefined;
+                return note;
+            });
+            // the slide goes the way the melody goes
+            const dir = stream[stream.length - 1].pitch >= stream[0].pitch ? 1 : -1;
+            const path = paths[Math.floor(random() * paths.length)];
+            const waves = stream.length >= 8 ? 2 : 1;
+            stream.forEach((note, i) => {
+                [note.sweepX, note.sweepHand] = pathX(path, i / (stream.length - 1), i, dir, waves);
+            });
+            // it lands on the downbeat
+            if (active[to]) {
+                let landing = bySlot.get(to);
+                if (!landing) {
+                    landing = { slot: to, strength: strengths[to], pitch: settledPitch(to), type: 4, holdSlots: 0, x: 0, line: -1, sx: 0, sy: 0, chord: false };
+                    notes.push(landing);
+                }
+                if (landing.type !== 3) {
+                    landing.type = 4;
+                    landing.holdSlots = 0;
+                }
+                if (options.difficulty !== 'EZ') {
+                    landing.chord = true;
+                    landing.triple = false;
+                    landing.partnerType = landing.type === 3 ? 1 : options.difficulty === 'HD' ? 1 : 4;
+                }
+            }
+            for (let s = from; s <= to; s++) inStream[s] = 1;
+            streams.push({ kind, path, start: slotTime(from), end: slotTime(to), notes: stream.length });
+            return true;
+        };
+        const runwaySlots = 4 * sub;
+        for (let b = 1; b < moods.length; b++) {
+            const drop = moods[b].state === 'drop';
+            const climaxStarts = moods[b].state === 'climax' && !lifted(b - 1);
+            if (!drop && !climaxStarts) continue;
+            const to = slotOf(moods[b].start);
+            // above EZ the run-up closes both hands in on the centre, so they burst out to the chord on the drop
+            lay('runway', to - runwaySlots, to, options.difficulty === 'EZ' ? ['cross', 'arc'] : ['converge']);
+        }
+        const fillRate = { EZ: 0, HD: 0.4, IN: 0.6, AT: 0.75 }[options.difficulty];
+        let runStart = -1;
+        for (let b = 0; b + 1 < moods.length; b++) {
+            if (!lifted(b)) {
+                runStart = -1;
+                continue;
+            }
+            if (runStart < 0) runStart = b;
+            if ((b - runStart) % 4 !== 3 || !lifted(b + 1) || random() >= fillRate) continue;
+            const to = slotOf(moods[b + 1].start);
+            lay('fill', to - 2 * sub, to, ['cross', 'converge', 'arc', 'wave']);
+        }
+        notes.sort((a, b) => a.slot - b.slot);
+    }
+
     // with several fingers the strongest chords take a third note
     const tripleRate = style.triple[options.difficulty];
     if (tripleRate) {
@@ -963,6 +1096,7 @@ export const generateChart = (analysis: AudioAnalysis, options: GeneratorOptions
         noteTimes: notes.map(n => slotTime(n.slot)),
         accentAt,
         seed: options.seed,
+        stagingSeed: options.stagingSeed,
     }) : undefined;
 
     // official time unit is 1/32 beat
@@ -1047,7 +1181,7 @@ export const generateChart = (analysis: AudioAnalysis, options: GeneratorOptions
         return pitches.length > 1 ? lo / (pitches.length - 1) : 0.5;
     };
     /** a placed note: where along which line, and where on the screen */
-    interface Placed { time: number; end: number; line: number; p: number; at: Point; type: OfficialNote['type'] }
+    interface Placed { time: number; end: number; line: number; p: number; at: Point; type: OfficialNote['type']; hand: number }
     const placed: Placed[] = [];
     const chords: PlannedNote[] = [];
     const dropped = new Set<PlannedNote>();
@@ -1178,7 +1312,7 @@ export const generateChart = (analysis: AudioAnalysis, options: GeneratorOptions
         const rounded = Math.round(p * 100) / 100;
         const q = pointAt(f, rounded);
         Object.assign(note, { x: rounded, line: f.line, sx: q.x, sy: q.y, hand });
-        placed.push({ time: slotTime(note.slot), end, line: f.line, p: rounded, at: q, type: note.type });
+        placed.push({ time: slotTime(note.slot), end, line: f.line, p: rounded, at: q, type: note.type, hand });
         return q;
     };
 
@@ -1263,6 +1397,13 @@ export const generateChart = (analysis: AudioAnalysis, options: GeneratorOptions
         } else {
             figure = null;
         }
+        // a drag stream follows its path across the screen, hand by hand
+        if (note.sweepX !== undefined && note.type === 2) {
+            wantX = note.sweepX;
+            wantHand = note.sweepHand ?? null;
+            wantAlong = null;
+            figure = null;
+        }
         // figures land on the half-unit grid, so their steps stay even
         if (wantX !== null) wantX = Math.round(wantX * 2) / 2;
 
@@ -1301,9 +1442,9 @@ export const generateChart = (analysis: AudioAnalysis, options: GeneratorOptions
             for (const h of order) {
                 const f = frameFor(h, time, holdEnd);
                 const [low, high] = handRange(h, f, time);
-                // the drag right before a gliding drag of the same hand is meant to be close
+                // the drags just before a gliding drag of the same hand are its slide, meant to be close
                 const gliding = glides(h, note.type, time);
-                const blocking = neighbours.filter(other => !(gliding && other.time === hands[h].time && other.type === 2));
+                const blocking = neighbours.filter(other => !(gliding && other.type === 2 && other.hand === h && other.end <= time));
                 // a spot one of the hand's fingers is still on (or has only just left) is that finger's, not another's
                 const taken = style.fingers > 1 ? busyFingers(h, note.type, time) : [];
                 const ok = (p: number) => {
@@ -1573,6 +1714,7 @@ export const generateChart = (analysis: AudioAnalysis, options: GeneratorOptions
         chart,
         motion,
         choreography,
+        streams,
         hands: plannedHands,
         level: Math.round(Math.min(16.9, rateNotes(officialNotes.map(n => ({ time: toSeconds(n.time), type: n.type }))) + LEVEL_CALIBRATION[options.difficulty]) * 10) / 10,
         speed: {

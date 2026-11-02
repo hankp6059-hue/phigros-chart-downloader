@@ -8,7 +8,7 @@ import { PlayMode } from './PlayMode';
 import { encodeWav } from '../utils/wav';
 import { encodeOgg } from '../utils/oggEncode';
 import type { BarState } from '../utils/lineMotion';
-import type { Motif } from '../utils/choreography';
+import type { Ease, Entry, Motif } from '../utils/choreography';
 import FileSaver from 'file-saver';
 import { SavedSongSummary, deleteSavedSong, listSavedSongs, loadSavedSong, newSongId, saveSong } from '../utils/customSongStore';
 import {
@@ -17,6 +17,7 @@ import {
     FingeringStyle,
     GENERATOR_DIFFICULTIES,
     GeneratorDifficulty,
+    StreamPath,
     analyzeAudio,
     generateChart,
 } from '../utils/chartGenerator';
@@ -48,7 +49,11 @@ const FINGERING_HINTS: Record<FingeringStyle, string> = {
 const MOTIF_LABELS: Record<Motif, string> = {
     relay: '接力', split: '分线', stack: '叠线', fan: '扇形', cross: '交叉', orbit: '旋转', sweep: '横扫',
     flyIn: '飞入', mirror: '镜像', pendulum: '钟摆', converge: '汇聚', shatter: '碎裂', pulse: '闪线',
+    spiral: '螺旋', lattice: '网格', ripple: '涟漪', scissor: '剪刀',
 };
+const STREAM_LABELS: Record<StreamPath, string> = { cross: '横扫', converge: '双手收拢', arc: '弧线', wave: '波浪' };
+const EASE_LABELS: Record<Ease, string> = { smooth: '平滑', out: '急起缓停', in: '缓起急停', sine: '柔和', linger: '停顿' };
+const ENTRY_LABELS: Record<Entry, string> = { fade: '淡入', slide: '横移', drop: '落下', rise: '升起', unfold: '展开', turn: '转入' };
 
 const fileExtension = (file: File, fallback: string) => {
     const match = /\.([a-z0-9]+)$/i.exec(file.name);
@@ -117,6 +122,8 @@ export const CustomSongPopup: React.FC<CustomSongPopupProps> = ({ isOpen, onClos
     }, [latencyInput]);
     const [lineMotion, setLineMotion] = useState(true);
     const [speedChanges, setSpeedChanges] = useState(true);
+    // which staging of the judgment-line performances; changing it restages them and leaves the notes
+    const [stagingSeed, setStagingSeed] = useState(0);
     const [fingering, setFingering] = useState<FingeringStyle>('single');
 
     // songs saved in this browser; `savedId` is the one open (saving again updates it)
@@ -185,10 +192,10 @@ export const CustomSongPopup: React.FC<CustomSongPopupProps> = ({ isOpen, onClos
         }
     };
 
-    const snapshot = (values: { name: string; composer: string; charter: string; difficulty: string; levelOverride: string | null; bpm: string; offsetMs: string; lineMotion: boolean; speedChanges: boolean; fingering: string; cover: Blob | null }) =>
+    const snapshot = (values: { name: string; composer: string; charter: string; difficulty: string; levelOverride: string | null; bpm: string; offsetMs: string; lineMotion: boolean; speedChanges: boolean; fingering: string; stagingSeed?: number; cover: Blob | null }) =>
         JSON.stringify([values.name, values.composer, values.charter, values.difficulty, values.levelOverride, values.bpm, values.offsetMs,
-            values.lineMotion, values.speedChanges, values.fingering, values.cover ? values.cover.size : null]);
-    const currentSnapshot = snapshot({ name: name.trim() || '未命名', composer: composer.trim(), charter: charter.trim(), difficulty, levelOverride, bpm: bpmInput, offsetMs: offsetInput, lineMotion, speedChanges, fingering, cover: coverFile });
+            values.lineMotion, values.speedChanges, values.fingering, values.stagingSeed ?? 0, values.cover ? values.cover.size : null]);
+    const currentSnapshot = snapshot({ name: name.trim() || '未命名', composer: composer.trim(), charter: charter.trim(), difficulty, levelOverride, bpm: bpmInput, offsetMs: offsetInput, lineMotion, speedChanges, fingering, stagingSeed, cover: coverFile });
 
     const handleSave = async () => {
         if (!audioFile) return;
@@ -208,6 +215,7 @@ export const CustomSongPopup: React.FC<CustomSongPopupProps> = ({ isOpen, onClos
                 lineMotion,
                 speedChanges,
                 fingering,
+                stagingSeed,
                 audio: audioFile,
                 audioName: audioFile.name,
                 cover: coverFile,
@@ -239,6 +247,7 @@ export const CustomSongPopup: React.FC<CustomSongPopupProps> = ({ isOpen, onClos
             setLineMotion(song.lineMotion);
             setSpeedChanges(song.speedChanges);
             setFingering(song.fingering);
+            setStagingSeed(song.stagingSeed ?? 0);
             setCoverFile(song.cover ? new File([song.cover], song.coverName ?? 'cover.png', { type: song.cover.type }) : null);
             await handleAudio(new File([song.audio], song.audioName, { type: song.audio.type }), { bpm: song.bpm, offsetMs: song.offsetMs });
         } catch (e) {
@@ -276,6 +285,7 @@ export const CustomSongPopup: React.FC<CustomSongPopupProps> = ({ isOpen, onClos
         setBpmInput('');
         setOffsetInput('0');
         setShowPreview(false);
+        setStagingSeed(0);
         setError(null);
     };
 
@@ -296,8 +306,9 @@ export const CustomSongPopup: React.FC<CustomSongPopupProps> = ({ isOpen, onClos
             lineMotion,
             speedChanges,
             fingering,
+            stagingSeed,
         })])) as Record<GeneratorDifficulty, ReturnType<typeof generateChart>>;
-    }, [analysis, bpmValid, bpm, offsetMs, name, audioFile, lineMotion, speedChanges, fingering]);
+    }, [analysis, bpmValid, bpm, offsetMs, name, audioFile, lineMotion, speedChanges, fingering, stagingSeed]);
     const generated = charts?.[difficulty] ?? null;
 
     const level = levelOverride ?? (generated ? String(generated.level) : '');
@@ -513,11 +524,31 @@ export const CustomSongPopup: React.FC<CustomSongPopupProps> = ({ isOpen, onClos
                                         高潮风格：弹跳 {Math.round(generated.motion.character.bounce * 100)}% · 钟摆 {Math.round(generated.motion.character.pendulum * 100)}% · 波浪 {Math.round(generated.motion.character.wave * 100)}%
                                     </span>
                                 </div>
-                                {generated.choreography && generated.choreography.performances.length > 0 && (
-                                    <p className="text-[11px] leading-[1.6] text-slate-400" title="按歌曲段落、重音和风格编排，每首歌不同">
-                                        判定线演出 {generated.choreography.performances.length} 段（{generated.choreography.lineCount + 1} 条线）：
-                                        {generated.choreography.performances.map(p => MOTIF_LABELS[p.motif]).join(' → ')}
+                                {generated.streams.length > 0 && (
+                                    <p className="text-[11px] leading-[1.6] text-slate-400" title="高潮前一小节用黄键冲刺，落在高潮第一拍（EZ 以外为双押）；高潮里乐句结尾用两拍黄键滑进下一句">
+                                        <span className="text-[#ece34f]">黄键流 {generated.streams.length} 段</span>：
+                                        冲刺 {generated.streams.filter(s => s.kind === 'runway').length} · 高潮过门 {generated.streams.filter(s => s.kind === 'fill').length}
+                                        （{generated.streams.map(s => `${Math.floor(s.start / 60)}:${String(Math.floor(s.start % 60)).padStart(2, '0')} ${STREAM_LABELS[s.path]}`).join('、')}）
                                     </p>
+                                )}
+                                {generated.choreography && generated.choreography.performances.length > 0 && (
+                                    <div className="flex items-start gap-2">
+                                        <p className="flex-1 text-[11px] leading-[1.6] text-slate-400" title="按歌曲段落、重音和风格编排，每首歌不同；同一段动作每次出场的缓动、进场方式、节奏也不同">
+                                            判定线演出 {generated.choreography.performances.length} 段（{generated.choreography.lineCount + 1} 条线）：
+                                            {generated.choreography.performances.map(p => `${MOTIF_LABELS[p.motif]}·${ENTRY_LABELS[p.variant.entry]}${p.variant.snap ? '·卡点' : ''}`).join(' → ')}
+                                            <span className="block text-slate-500">
+                                                本曲风格：{generated.choreography.style.eases.map(e => EASE_LABELS[e]).join('/')}
+                                                {generated.choreography.style.stagger > 0 ? ' · 依次错开' : ''}
+                                                {generated.choreography.style.spin > 0 ? ' · 自转' : ''}
+                                                {generated.choreography.style.breathe > 0 ? ' · 随拍闪烁' : ''}
+                                                {stagingSeed > 0 ? ` · 第 ${stagingSeed + 1} 套` : ''}
+                                            </span>
+                                        </p>
+                                        <button type="button" onClick={() => setStagingSeed(s => s + 1)} title="音符不变，重新编排判定线演出"
+                                            className="shrink-0 px-2 py-1 rounded border border-white/15 text-[11px] text-slate-300 hover:bg-white/10">
+                                            换一套演出
+                                        </button>
+                                    </div>
                                 )}
                             </>
                         )}

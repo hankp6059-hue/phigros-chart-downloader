@@ -17,6 +17,8 @@ export interface SavedSong {
     lineMotion: boolean;
     speedChanges: boolean;
     fingering: FingeringStyle;
+    /** which staging of the judgment-line performances was picked (missing in songs saved before: 0) */
+    stagingSeed?: number;
     audio: Blob;
     audioName: string;
     cover: Blob | null;
