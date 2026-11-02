@@ -60,11 +60,68 @@ export const createFloorAt = (line: Line) => {
     }
     return (seconds: number) => {
         if (!events.length) return seconds;
-        let i = events.length - 1;
-        while (i > 0 && starts[i] > seconds) i--;
-        return floors[i] + (seconds - starts[i]) * events[i].value;
+        // last event starting at or before `seconds` (the first one if none does); starts never decrease
+        let lo = 0;
+        let hi = events.length - 1;
+        while (lo < hi) {
+            const mid = (lo + hi + 1) >> 1;
+            if (starts[mid] <= seconds) lo = mid;
+            else hi = mid - 1;
+        }
+        return floors[lo] + (seconds - starts[lo]) * events[lo].value;
     };
 };
+
+const floorCache = new WeakMap<Line, (seconds: number) => number>();
+
+/** createFloorAt, built once per line object (charts are rebuilt, never edited in place). */
+const cachedFloorAt = (line: Line) => {
+    let floorAt = floorCache.get(line);
+    if (!floorAt) {
+        floorAt = createFloorAt(line);
+        floorCache.set(line, floorAt);
+    }
+    return floorAt;
+};
+
+interface NoteIndex {
+    /** time and floorPosition both never decrease, so the visible notes form a contiguous run */
+    ordered: boolean;
+    /** longest hold, in chart units */
+    maxHold: number;
+}
+
+const noteIndexCache = new WeakMap<OfficialNote[], NoteIndex>();
+
+const noteIndex = (notes: OfficialNote[]) => {
+    let index = noteIndexCache.get(notes);
+    if (!index) {
+        let ordered = true;
+        let maxHold = 0;
+        for (let i = 0; i < notes.length; i++) {
+            if (i > 0 && (notes[i].time < notes[i - 1].time || notes[i].floorPosition < notes[i - 1].floorPosition)) ordered = false;
+            if (notes[i].type === 3) maxHold = Math.max(maxHold, notes[i].holdTime);
+        }
+        index = { ordered, maxHold };
+        noteIndexCache.set(notes, index);
+    }
+    return index;
+};
+
+/** First index whose value is >= `target` (notes.length if none), for a non-decreasing key. */
+const lowerBound = (notes: OfficialNote[], key: (note: OfficialNote) => number, target: number) => {
+    let lo = 0;
+    let hi = notes.length;
+    while (lo < hi) {
+        const mid = (lo + hi) >> 1;
+        if (key(notes[mid]) < target) lo = mid + 1;
+        else hi = mid;
+    }
+    return lo;
+};
+
+const noteTime = (note: OfficialNote) => note.time;
+const noteFloor = (note: OfficialNote) => note.floorPosition;
 
 export const linePoseAt = (line: Line, seconds: number, width: number, height: number): ScreenPose => {
     const time = seconds / secondsPerUnit(line);
@@ -86,7 +143,8 @@ export const noteMetrics = (width: number, height: number) => ({
 
 export interface RenderOptions {
     cover?: HTMLImageElement | null;
-    /** how far past the line notes are drawn once their time has come (preview hides them at once) */
+    /** how far past the line notes are drawn once their time has come (preview hides them at once); `index`
+     * numbers all lines' notes in turn (see noteOffsets) */
     isHidden?: (index: number, note: OfficialNote) => boolean;
     /** holds currently being held stay drawn from the line until their end */
     isHolding?: (index: number) => boolean;
@@ -94,11 +152,18 @@ export interface RenderOptions {
     previewHits?: boolean;
 }
 
-export const renderChart = (g: CanvasRenderingContext2D, chart: OfficialChart, seconds: number, width: number, height: number, options: RenderOptions = {}) => {
-    const line = chart.judgeLineList[0];
-    const spu = secondsPerUnit(line);
-    const floorAt = createFloorAt(line);
+/** Index of each line's first note when all lines' notes are numbered in turn (line by line, in order). */
+export const noteOffsets = (chart: OfficialChart) => {
+    const offsets: number[] = [];
+    let total = 0;
+    for (const line of chart.judgeLineList) {
+        offsets.push(total);
+        total += line.notesAbove.length;
+    }
+    return offsets;
+};
 
+export const renderChart = (g: CanvasRenderingContext2D, chart: OfficialChart, seconds: number, width: number, height: number, options: RenderOptions = {}) => {
     g.fillStyle = '#05070a';
     g.fillRect(0, 0, width, height);
     const cover = options.cover;
@@ -112,24 +177,75 @@ export const renderChart = (g: CanvasRenderingContext2D, chart: OfficialChart, s
         g.globalAlpha = 1;
     }
 
-    const pose = linePoseAt(line, seconds, width, height);
-    const { unit, noteWidth, noteHeight, floorScale } = noteMetrics(width, height);
+    const metrics = noteMetrics(width, height);
+    const poses = chart.judgeLineList.map(line => linePoseAt(line, seconds, width, height));
+
+    // every line first, then every line's notes, so notes are never covered by another line
+    const thickness = Math.max(2, height * 0.006);
+    g.fillStyle = '#feffa9';
+    for (const pose of poses) {
+        if (pose.alpha <= 0) continue;
+        g.save();
+        g.translate(pose.x, pose.y);
+        g.rotate((-pose.angle * Math.PI) / 180);
+        g.globalAlpha = pose.alpha;
+        g.fillRect(-width * 3, -thickness / 2, width * 6, thickness);
+        g.restore();
+    }
+    g.globalAlpha = 1;
+
+    const offsets = noteOffsets(chart);
+    chart.judgeLineList.forEach((line, l) => {
+        if (line.notesAbove.length) drawNotes(g, line, poses[l], offsets[l], seconds, width, height, metrics, options);
+    });
+};
+
+/** Notes of one line, numbered from `offset` for the hidden / holding callbacks. */
+const drawNotes = (
+    g: CanvasRenderingContext2D,
+    line: Line,
+    pose: ScreenPose,
+    offset: number,
+    seconds: number,
+    width: number,
+    height: number,
+    { unit, noteWidth, noteHeight, floorScale }: ReturnType<typeof noteMetrics>,
+    options: RenderOptions,
+) => {
+    const spu = secondsPerUnit(line);
+    const floorAt = cachedFloorAt(line);
     const currentFloor = floorAt(seconds);
 
     g.save();
     g.translate(pose.x, pose.y);
     g.rotate((-pose.angle * Math.PI) / 180);
 
-    g.globalAlpha = pose.alpha;
-    g.fillStyle = '#feffa9';
-    const thickness = Math.max(2, height * 0.006);
-    g.fillRect(-width * 3, -thickness / 2, width * 6, thickness);
-    g.globalAlpha = 1;
-
     const notes = line.notesAbove;
-    for (let i = 0; i < notes.length; i++) {
+    const range = height * 2;
+    let first = 0;
+    let windowed = false;
+    const { ordered, maxHold } = noteIndex(notes);
+    if (ordered) {
+        windowed = true;
+        // Notes before `first` draw nothing visible:
+        // - a note whose floorPosition is below `lowestFloor` sits further from the line's origin than any
+        //   canvas pixel (rotation keeps distances), so drawing it as a plain note paints nothing;
+        // - a hold that started more than the longest hold ago has ended (skipped below), and a note hit
+        //   more than 0.25 s ago has no preview outline left.
+        // Both keys never decrease, so each condition holds for a prefix; notes before both cut-offs are
+        // skipped. Unordered note lists fall back to the full loop.
+        const reach = Math.max(Math.hypot(pose.x, pose.y), Math.hypot(width - pose.x, pose.y), Math.hypot(pose.x, height - pose.y), Math.hypot(width - pose.x, height - pose.y))
+            + Math.hypot(noteWidth, noteHeight) + 1;
+        const lowestFloor = currentFloor - reach / floorScale;
+        const recent = Math.max(maxHold * spu, options.previewHits ? 0.25 : 0) + 1e-3;
+        first = Math.min(lowerBound(notes, noteFloor, lowestFloor), lowerBound(notes, noteTime, (seconds - recent) / spu));
+    }
+    for (let i = first; i < notes.length; i++) {
         const note = notes[i];
         const hitSeconds = note.time * spu;
+        // every later note is at least as far up (drawn nothing, see the range checks below) and not yet hit
+        // (no preview outline)
+        if (windowed && (note.floorPosition - currentFloor) * floorScale > range && hitSeconds > seconds) break;
         const endSeconds = (note.time + note.holdTime) * spu;
         const lx = note.positionX * unit;
 
@@ -141,11 +257,11 @@ export const renderChart = (g: CanvasRenderingContext2D, chart: OfficialChart, s
                 g.strokeRect(lx - noteWidth / 2 - since * 60, -noteHeight - since * 60, noteWidth + since * 120, noteHeight * 2 + since * 120);
             }
         }
-        if (options.isHidden?.(i, note)) continue;
+        if (options.isHidden?.(offset + i, note)) continue;
 
         if (note.type === 3) {
             if (seconds > endSeconds) continue;
-            const holding = options.isHolding?.(i) ?? seconds >= hitSeconds;
+            const holding = options.isHolding?.(offset + i) ?? seconds >= hitSeconds;
             const head = holding ? Math.max(0, (note.floorPosition - currentFloor) * floorScale) : (note.floorPosition - currentFloor) * floorScale;
             const tail = (floorAt(endSeconds) - currentFloor) * floorScale;
             if (head > height * 2) continue;

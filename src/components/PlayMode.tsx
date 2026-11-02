@@ -49,6 +49,28 @@ const EFFECT_SECONDS = 0.35;
 // seconds counted down after resuming, during which the chart stays still
 const RESUME_COUNTDOWN = 3;
 const EFFECT_COLORS: Record<number, string> = { [Judgment.Perfect]: '#ffe17a', [Judgment.Good]: '#7dd3fc' };
+// the smoothed song clock snaps back to the audio clock when they drift further apart than this
+const CLOCK_RESYNC = 0.018;
+// how quickly (seconds) the smoothed clock eases onto the audio clock's average
+const CLOCK_EASE = 0.3;
+
+/**
+ * A continuous song clock. AudioContext.currentTime moves in steps (10-20 ms on iPad Safari), so between
+ * steps it runs on performance.now() and eases towards the audio clock; it never goes back, and it
+ * stands still whenever the audio clock does (suspended for pause/countdown, or not yet moving again
+ * after a resume).
+ */
+interface SongClock {
+    /** smoothed song time last handed out */
+    time: number;
+    /** performance.now() of that, in seconds */
+    at: number;
+    /** last audio song time seen, and whether it has moved since the context last ran */
+    raw: number;
+    moving: boolean;
+    /** largest recent step of the audio clock: steps bigger than the resync bound must not trigger it */
+    step: number;
+}
 
 /** Full-screen touch play of a generated chart. */
 export const PlayMode: React.FC<PlayModeProps> = ({ chart, audio, title, difficulty, level, cover, latencyMs, onExit }) => {
@@ -60,15 +82,17 @@ export const PlayMode: React.FC<PlayModeProps> = ({ chart, audio, title, difficu
     const fingersRef = useRef(new Map<number, Finger>());
     const effectsRef = useRef<Effect[]>([]);
     const frameRef = useRef(0);
+    const clockRef = useRef<SongClock | null>(null);
+    const fontsRef = useRef<{ sans: string; mono: string } | null>(null);
     const [phase, setPhase] = useState<Phase>('ready');
-    const [combo, setCombo] = useState(0);
     const [countdown, setCountdown] = useState(0);
     const [portrait, setPortrait] = useState(false);
     const [summary, setSummary] = useState<{ perfect: number; good: number; bad: number; miss: number; maxCombo: number; total: number } | null>(null);
 
-    const line = chart.judgeLineList[0];
-    const lastEnd = line.notesAbove.reduce((m, n) => Math.max(m, ((n.time + n.holdTime) * 1.875) / line.bpm), 0);
-    const firstNote = line.notesAbove.length ? (line.notesAbove[0].time * 1.875) / line.bpm : 0;
+    const lines = chart.judgeLineList;
+    const noteSeconds = lines.flatMap(line => line.notesAbove.map(n => ({ start: (n.time * 1.875) / line.bpm, end: ((n.time + n.holdTime) * 1.875) / line.bpm })));
+    const lastEnd = noteSeconds.reduce((m, n) => Math.max(m, n.end), 0);
+    const firstNote = noteSeconds.length ? Math.min(...noteSeconds.map(n => n.start)) : 0;
 
     useEffect(() => {
         if (!cover) return;
@@ -92,12 +116,43 @@ export const PlayMode: React.FC<PlayModeProps> = ({ chart, audio, title, difficu
         return () => window.removeEventListener('resize', resize);
     }, []);
 
-    /** Song time the player is judged against. */
+    /** Song time the player is judged against and the chart is drawn at (one clock for both). */
     const songTime = useCallback(() => {
         const playback = audioRef.current;
         if (!playback) return -Infinity;
         const output = (playback.context as AudioContext & { outputLatency?: number }).outputLatency ?? 0;
-        return playback.context.currentTime - playback.startAt - output - latencyMs / 1000;
+        const raw = playback.context.currentTime - playback.startAt - output - latencyMs / 1000;
+        const now = performance.now() / 1000;
+        const clock = clockRef.current;
+        if (!clock) {
+            clockRef.current = { time: raw, at: now, raw, moving: false, step: 0 };
+            return raw;
+        }
+        if (playback.context.state !== 'running') {
+            // suspended (pause, countdown): hold still, and wait for the audio clock to move again
+            clock.raw = raw;
+            clock.moving = false;
+            clock.at = now;
+            return clock.time;
+        }
+        const wasMoving = clock.moving;
+        if (raw !== clock.raw) {
+            if (wasMoving) clock.step = Math.min(0.05, Math.max(raw - clock.raw, clock.step * 0.98));
+            clock.raw = raw;
+            clock.moving = true;
+        }
+        // time spent stopped (paused, counting down, waiting for the audio to restart) does not count
+        const elapsed = wasMoving ? now - clock.at : 0;
+        clock.at = now;
+        // just resumed and the audio has not restarted yet: carry on from where it stopped, not ahead of it
+        if (!clock.moving) return clock.time;
+        let next = clock.time + elapsed;
+        const drift = raw - next;
+        if (Math.abs(drift) > Math.max(CLOCK_RESYNC, clock.step)) next = raw;
+        else next += drift * (1 - Math.exp(-elapsed / CLOCK_EASE));
+        // never backwards: an audio stall freezes the clock until the audio catches up
+        clock.time = Math.max(clock.time, next);
+        return clock.time;
     }, [latencyMs]);
 
     const stopAudio = useCallback(() => {
@@ -115,12 +170,13 @@ export const PlayMode: React.FC<PlayModeProps> = ({ chart, audio, title, difficu
         const session = sessionRef.current;
         const canvas = canvasRef.current;
         if (!session || !canvas) return;
-        const pose = linePoseAt(line, time, canvas.width, canvas.height);
         const { unit } = noteMetrics(canvas.width, canvas.height);
-        const radians = (pose.angle * Math.PI) / 180;
         for (const hit of hits) {
             if (hit.judgment === Judgment.Miss) continue;
-            const x = session.notes[hit.index].x * unit;
+            const note = session.notes[hit.index];
+            const pose = linePoseAt(lines[note.line], time, canvas.width, canvas.height);
+            const radians = (pose.angle * Math.PI) / 180;
+            const x = note.x * unit;
             effectsRef.current.push({
                 x: pose.x + x * Math.cos(radians),
                 y: pose.y - x * Math.sin(radians),
@@ -129,17 +185,18 @@ export const PlayMode: React.FC<PlayModeProps> = ({ chart, audio, title, difficu
                 color: EFFECT_COLORS[hit.judgment],
             });
         }
-        setCombo(session.combo);
-    }, [line]);
+    }, [lines]);
 
-    /** Where a screen point falls along the judgment line, in positionX units. */
+    /** Where a screen point falls along each judgment line, in positionX units. */
     const project = useCallback((x: number, y: number, time: number) => {
         const canvas = canvasRef.current!;
-        const pose = linePoseAt(line, time, canvas.width, canvas.height);
-        const radians = (pose.angle * Math.PI) / 180;
-        const along = (x - pose.x) * Math.cos(radians) - (y - pose.y) * Math.sin(radians);
-        return along / noteMetrics(canvas.width, canvas.height).unit;
-    }, [line]);
+        const { unit } = noteMetrics(canvas.width, canvas.height);
+        return lines.map(line => {
+            const pose = linePoseAt(line, time, canvas.width, canvas.height);
+            const radians = (pose.angle * Math.PI) / 180;
+            return ((x - pose.x) * Math.cos(radians) - (y - pose.y) * Math.sin(radians)) / unit;
+        });
+    }, [lines]);
 
     const frame = useCallback(() => {
         const canvas = canvasRef.current;
@@ -185,13 +242,45 @@ export const PlayMode: React.FC<PlayModeProps> = ({ chart, audio, title, difficu
         }
         g.globalAlpha = 1;
 
+        const finished = session.finished && time > lastEnd + 1;
+
+        // combo, top centre: drawn here so dense passages do not re-render React on every hit
+        // (not on the frame left behind the results, as before)
+        if (session.combo >= 3 && !finished) {
+            const css = canvas.width / (canvas.clientWidth || canvas.width);
+            if (!fontsRef.current) {
+                const mono = getComputedStyle(document.documentElement).getPropertyValue('--font-mono').trim();
+                fontsRef.current = { sans: getComputedStyle(canvas).fontFamily || 'sans-serif', mono: mono || 'ui-monospace, Menlo, monospace' };
+            }
+            const { sans, mono } = fontsRef.current;
+            const centre = canvas.width / 2;
+            g.textAlign = 'center';
+            g.textBaseline = 'middle';
+            g.fillStyle = '#ffffff';
+            g.font = `700 ${34 * css}px ${sans}`;
+            // 34px number with leading-none, 12px from the top
+            g.fillText(String(session.combo), centre, (12 + 17) * css);
+            // 11px label spaced .3em per letter (trailing space included, as CSS letter-spacing does)
+            g.font = `${11 * css}px ${mono}`;
+            g.fillStyle = '#cbd5e1';
+            g.textAlign = 'left';
+            const label = 'COMBO';
+            const spacing = 11 * 0.3 * css;
+            const widths = [...label].map(c => g.measureText(c).width);
+            let x = centre - (widths.reduce((a, b) => a + b, 0) + spacing * label.length) / 2;
+            [...label].forEach((c, k) => {
+                g.fillText(c, x, (12 + 34 + 16.5 / 2) * css);
+                x += widths[k] + spacing;
+            });
+        }
+
         // song progress
         g.fillStyle = 'rgba(255,255,255,0.12)';
         g.fillRect(0, 0, canvas.width, Math.max(3, canvas.height * 0.005));
         g.fillStyle = '#feffa9';
         g.fillRect(0, 0, canvas.width * Math.min(1, Math.max(0, time / audio.duration)), Math.max(3, canvas.height * 0.005));
 
-        if (session.finished && time > lastEnd + 1) {
+        if (finished) {
             setSummary({ ...session.counts, maxCombo: session.maxCombo, total: session.total });
             setPhase('results');
             return;
@@ -215,7 +304,7 @@ export const PlayMode: React.FC<PlayModeProps> = ({ chart, audio, title, difficu
         sessionRef.current = new PlaySession(chart);
         fingersRef.current.clear();
         effectsRef.current = [];
-        setCombo(0);
+        clockRef.current = null;
         setSummary(null);
         setPhase('playing');
         frameRef.current = requestAnimationFrame(frame);
@@ -225,6 +314,8 @@ export const PlayMode: React.FC<PlayModeProps> = ({ chart, audio, title, difficu
         if (!audioRef.current) return;
         cancelAnimationFrame(frameRef.current);
         audioRef.current.context.suspend();
+        // the chart stops where it was last drawn; it moves again only once the resumed audio does
+        if (clockRef.current) clockRef.current.moving = false;
         setPhase(p => (p === 'playing' || p === 'countdown' ? 'paused' : p));
     }, []);
 
@@ -337,12 +428,6 @@ export const PlayMode: React.FC<PlayModeProps> = ({ chart, audio, title, difficu
                     <button type="button" onClick={pause} aria-label="暂停" className="absolute top-3 left-3 w-11 h-11 rounded-full bg-white/10 text-white flex items-center justify-center">
                         <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><rect x="3" y="2" width="3.5" height="12" rx="1" /><rect x="9.5" y="2" width="3.5" height="12" rx="1" /></svg>
                     </button>
-                    {combo >= 3 && (
-                        <div className="pointer-events-none absolute top-3 left-1/2 -translate-x-1/2 flex flex-col items-center text-white">
-                            <span className="text-[34px] font-bold leading-none">{combo}</span>
-                            <span className="font-mono text-[11px] tracking-[.3em] text-slate-300">COMBO</span>
-                        </div>
-                    )}
                     <div className="pointer-events-none absolute bottom-3 left-4 flex items-center gap-3 text-white/90">
                         <span className="text-[15px] font-semibold">{title}</span>
                         <span className="text-[13px] font-mono opacity-80">{difficulty} Lv.{level}</span>
