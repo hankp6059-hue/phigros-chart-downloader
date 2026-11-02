@@ -231,6 +231,30 @@ export const drawHitEffect = (g: CanvasRenderingContext2D, x: number, y: number,
     g.globalAlpha = 0.35 * fade;
     g.lineWidth *= 2.6;
     g.strokeRect(-s / 2, -s / 2, s, s);
+
+    // as in the original: a second, level square frame, two arcs sweeping round, and a glowing core
+    g.rotate((-ease * Math.PI) / 4);
+    const level = s * 0.82;
+    g.globalAlpha = fade ** 1.6;
+    g.lineWidth = Math.max(1, scale * 0.03);
+    g.strokeRect(-level / 2, -level / 2, level, level);
+    const radius = scale * (0.3 + 0.28 * ease);
+    const sweep = Math.PI * (0.25 + 1.4 * ease) + hash01(seed, 30) * Math.PI;
+    g.globalAlpha = 0.9 * fade;
+    g.lineWidth = Math.max(1.5, scale * 0.04 * (1 - p * 0.5));
+    for (const offset of [0, Math.PI]) {
+        g.beginPath();
+        g.arc(0, 0, radius, sweep + offset, sweep + offset + Math.PI * 0.6);
+        g.stroke();
+    }
+    const core = g.createRadialGradient(0, 0, 0, 0, 0, scale * 0.22);
+    core.addColorStop(0, color);
+    core.addColorStop(1, 'rgba(0,0,0,0)');
+    g.fillStyle = core;
+    g.globalAlpha = fade ** 2;
+    g.beginPath();
+    g.arc(0, 0, scale * 0.22, 0, Math.PI * 2);
+    g.fill();
     g.restore();
 };
 
