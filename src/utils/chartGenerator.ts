@@ -12,6 +12,27 @@ export type GeneratorDifficulty = 'EZ' | 'HD' | 'IN' | 'AT';
 
 export const GENERATOR_DIFFICULTIES: GeneratorDifficulty[] = ['EZ', 'HD', 'IN', 'AT'];
 
+/**
+ * what the notes are laid out like: 'keys' a keyboard (low notes left, high notes right, the left hand on the
+ * bass and the right on the melody), 'drums' a drum kit (kick under the left hand, snare and cymbals under
+ * the right), 'free' no instrument (figures and the melody's contour only)
+ */
+export type PlayStyle = 'keys' | 'drums' | 'free';
+
+export const PLAY_STYLES: PlayStyle[] = ['keys', 'drums', 'free'];
+
+/** spectral flatness above which a song reads as drums rather than a tuned instrument */
+const DRUM_FLATNESS = 0.3;
+
+/** Whether a song sounds more like a tuned instrument (piano, voice, synth) or like drums, from how noisy its loud parts are. */
+export const detectPlayStyle = (analysis: AudioAnalysis): { style: 'keys' | 'drums'; flatness: number } => {
+    const values: number[] = [];
+    for (let f = 0; f < analysis.flatness.length; f++) if (analysis.loudness[f] > 0.25) values.push(analysis.flatness[f]);
+    values.sort((a, b) => a - b);
+    const flatness = values.length ? values[values.length >> 1] : 0;
+    return { style: flatness > DRUM_FLATNESS ? 'drums' : 'keys', flatness };
+};
+
 /** how the chart is meant to be played: one finger per hand (two thumbs, on a phone) or several (on a tablet) */
 export type FingeringStyle = 'single' | 'multi';
 
@@ -37,6 +58,12 @@ export interface AudioAnalysis {
     brightness: Float32Array;
     /** energy below ~150 Hz per frame (kick and bass line), 0..1 */
     lowLevel: Float32Array;
+    /** dominant pitch of the bass range (~40-250 Hz) per frame, in octaves (log2 Hz) */
+    bassPitch: Float32Array;
+    /** onset strength above ~5 kHz (hi-hats, cymbals, snare rattle), roughly 0..1 */
+    highEnvelope: Float32Array;
+    /** spectral flatness per frame, 0 (pure tones) .. 1 (noise): drums sound flat, pianos and voices peaked */
+    flatness: Float32Array;
     bpm: number;
     /** time of the first beat on the detected grid, in seconds (0 <= firstBeat < beat length) */
     firstBeat: number;
@@ -58,6 +85,8 @@ export interface GeneratorOptions {
     fingering?: FingeringStyle;
     /** 0 for the song's first staging of extra judgment lines; another number stages it anew (notes stay) */
     stagingSeed?: number;
+    /** what the notes are laid out like (default 'auto': keys or drums, by the sound) */
+    playStyle?: PlayStyle | 'auto';
 }
 
 export interface GeneratedChart {
@@ -68,6 +97,8 @@ export interface GeneratedChart {
     choreography?: Choreography;
     /** drag streams written where the music lifts */
     streams: DragStream[];
+    /** what the notes were laid out like */
+    playStyle: PlayStyle;
     /** the hand (0 left, 1 right) planned for each note, per judgment line in the chart's note order */
     hands: number[][];
     /** difficulty constant on the official scale */
@@ -173,6 +204,14 @@ export const analyzeAudio = (channels: Float32Array[], sampleRate: number, tempo
     const bassBins = Math.max(2, Math.round((250 * fftSize) / sampleRate));
     const flux = new Float32Array(frameCount);
     const bassFlux = new Float32Array(frameCount);
+    const highFlux = new Float32Array(frameCount);
+    const highBin = Math.min(bins - 1, Math.round((5000 * fftSize) / sampleRate));
+    const flatFrom = Math.max(1, Math.round((100 * fftSize) / sampleRate));
+    const flatTo = Math.min(bins - 1, Math.round((8000 * fftSize) / sampleRate));
+    const flatness = new Float32Array(frameCount);
+    const bassPitch = new Float32Array(frameCount);
+    const bassLow = Math.max(1, Math.round((40 * pitchSize) / sampleRate));
+    const bassHigh = Math.round((250 * pitchSize) / sampleRate);
     const loudness = new Float32Array(frameCount);
     const pitch = new Float32Array(frameCount);
     const tone = new Float32Array(frameCount);
@@ -204,16 +243,26 @@ export const analyzeAudio = (channels: Float32Array[], sampleRate: number, tempo
         let sum = 0;
         let weighted = 0;
         let total = 0;
+        let logSum = 0;
+        let linearSum = 0;
         for (let k = 1; k < bins; k++) {
             const magnitude = Math.hypot(re[k], im[k]);
             current[k] = Math.log1p(100 * magnitude);
             if (f > 0) sum += Math.max(0, current[k] - previous[k]);
             if (k === bassBins) bassFlux[f] = sum;
+            if (k === highBin) highFlux[f] = -sum;
+            if (k >= flatFrom && k <= flatTo) {
+                logSum += Math.log(magnitude + 1e-9);
+                linearSum += magnitude;
+            }
             weighted += k * magnitude;
             total += magnitude;
             if (k <= lowBins) lowLevel[f] += magnitude * magnitude;
         }
         flux[f] = sum;
+        highFlux[f] += sum;
+        const flatBins = flatTo - flatFrom + 1;
+        flatness[f] = linearSum > 1e-6 ? Math.exp(logSum / flatBins) / (linearSum / flatBins) : 1;
         brightness[f] = Math.log2(Math.max(1, (weighted / Math.max(total, 1e-9)) * (sampleRate / fftSize)));
 
         const pitchOffset = offset + fftSize / 2 - pitchSize / 2;
@@ -234,12 +283,24 @@ export const analyzeAudio = (channels: Float32Array[], sampleRate: number, tempo
         const shift = curvature < 0 ? Math.max(-0.5, Math.min(0.5, (0.5 * (a - c)) / curvature)) : 0;
         pitch[f] = Math.log2(((peakBin + shift) * sampleRate) / pitchSize);
         tone[f] = Math.hypot(pitchRe[peakBin], pitchIm[peakBin]);
+        // the bass line's pitch, the same way over its own range (coarse: a bin is a few semitones down there,
+        // enough to tell a low bass note from a higher one)
+        let bassPeak = bassLow;
+        for (let k = bassLow - 1; k <= bassHigh + 1; k++) {
+            pitchMagnitude[k] = Math.log1p(100 * Math.hypot(pitchRe[k], pitchIm[k]));
+            if (k >= bassLow && k <= bassHigh && pitchMagnitude[k] > pitchMagnitude[bassPeak]) bassPeak = k;
+        }
+        const [ba, bb, bc] = [pitchMagnitude[bassPeak - 1] ?? 0, pitchMagnitude[bassPeak], pitchMagnitude[bassPeak + 1]];
+        const bassCurvature = ba - 2 * bb + bc;
+        const bassShift = bassCurvature < 0 ? Math.max(-0.5, Math.min(0.5, (0.5 * (ba - bc)) / bassCurvature)) : 0;
+        bassPitch[f] = Math.log2(((bassPeak + bassShift) * sampleRate) / pitchSize);
         [previous, current] = [current, previous];
     }
 
     const frameSeconds = hop / sampleRate;
     const envelope = onsetEnvelope(flux, frameSeconds);
     const bassEnvelope = onsetEnvelope(bassFlux, frameSeconds);
+    const highEnvelope = onsetEnvelope(highFlux, frameSeconds);
     const loudnessScale = percentile(loudness, 0.99);
     const lowScale = percentile(lowLevel, 0.99);
     for (let i = 0; i < frameCount; i++) {
@@ -340,6 +401,9 @@ export const analyzeAudio = (channels: Float32Array[], sampleRate: number, tempo
         tone,
         brightness,
         lowLevel,
+        bassPitch,
+        highEnvelope,
+        flatness,
         bpm,
         firstBeat,
     };
@@ -551,10 +615,15 @@ interface PlannedNote {
     /** where a drag stream's path wants this note across the screen, and the hand it is for */
     sweepX?: number;
     sweepHand?: number;
+    /** where the instrument puts this note across the screen (its key, or its drum), and the hand that plays it */
+    keyX?: number;
+    keyHand?: number;
+    /** where the instrument puts a chord's other note (the bass under a melody note, the kick under a snare) */
+    partnerX?: number;
 }
 
 /** the path a drag stream's notes follow across the screen */
-export type StreamPath = 'cross' | 'converge' | 'arc' | 'wave';
+export type StreamPath = 'cross' | 'converge' | 'arc' | 'wave' | 'keys' | 'roll';
 
 export interface DragStream {
     /** 'runway': the run-up into a drop or a climax; 'fill': the end of a climax phrase into the next */
@@ -956,6 +1025,7 @@ export const generateChart = (analysis: AudioAnalysis, options: GeneratorOptions
     // downbeat with a flick, chorded above EZ; and in a climax, the last two beats of a phrase slide into the
     // next phrase's downbeat. each stream follows one path across the screen: one sweep from side to side,
     // both hands closing in on the centre, one hand arching in and out, or a wave
+    const playStyle: PlayStyle = !options.playStyle || options.playStyle === 'auto' ? detectPlayStyle(analysis).style : options.playStyle;
     const moods = readBarMoods(analysis, options.bpm, firstBeat);
     const streams: DragStream[] = [];
     {
@@ -983,6 +1053,10 @@ export const generateChart = (analysis: AudioAnalysis, options: GeneratorOptions
                     return [dir * ((1 + edge) / 2 + ((edge - 1) / 2) * Math.sin(2 * Math.PI * waves * u)), dir > 0 ? 1 : 0];
             }
         };
+        // on keys a stream is the run the music really plays, up or down the keys: only slots that sound like
+        // a note of their own; on drums it is a roll down the toms, right to left
+        const noteStrengths = notes.map(n => n.strength).sort((a, b) => a - b);
+        const keyFloor = noteStrengths[Math.floor(0.3 * (noteStrengths.length - 1))] ?? 0;
         const lay = (kind: DragStream['kind'], from: number, to: number, paths: StreamPath[]) => {
             from = Math.max(0, from);
             if (to > slotCount || to - from < 2 * step) return false;
@@ -992,7 +1066,7 @@ export const generateChart = (analysis: AudioAnalysis, options: GeneratorOptions
             // the slide stops a step before the downbeat, so the hands are up again to hit it together
             const stop = to - step;
             const slots = new Set<number>();
-            for (let s = from; s < stop; s += step) if (active[s]) slots.add(s);
+            for (let s = from; s < stop; s += step) if (active[s] && (playStyle !== 'keys' || strengths[s] >= keyFloor)) slots.add(s);
             for (const n of notes) if (n.slot >= from && n.slot < stop) slots.add(n.slot);
             const ordered = [...slots].sort((a, b) => a - b);
             // too little sounding there for a stream
@@ -1014,11 +1088,14 @@ export const generateChart = (analysis: AudioAnalysis, options: GeneratorOptions
             });
             // the slide goes the way the melody goes
             const dir = stream[stream.length - 1].pitch >= stream[0].pitch ? 1 : -1;
-            const path = paths[Math.floor(random() * paths.length)];
+            const path = playStyle === 'keys' ? 'keys' : playStyle === 'drums' ? 'roll' : paths[Math.floor(random() * paths.length)];
             const waves = stream.length >= 8 ? 2 : 1;
-            stream.forEach((note, i) => {
-                [note.sweepX, note.sweepHand] = pathX(path, i / (stream.length - 1), i, dir, waves);
-            });
+            // (on keys the notes keep their keys, set below)
+            if (path !== 'keys') {
+                stream.forEach((note, i) => {
+                    [note.sweepX, note.sweepHand] = path === 'roll' ? pathX('cross', i / (stream.length - 1), i, -1, 1) : pathX(path, i / (stream.length - 1), i, dir, waves);
+                });
+            }
             // it lands on the downbeat
             if (active[to]) {
                 let landing = bySlot.get(to);
@@ -1041,10 +1118,13 @@ export const generateChart = (analysis: AudioAnalysis, options: GeneratorOptions
             return true;
         };
         const runwaySlots = 4 * sub;
+        // a climax counts once it lasts two bars after two that are not; run-ups at least eight bars apart
+        let lastRunway = -Infinity;
         for (let b = 1; b < moods.length; b++) {
             const drop = moods[b].state === 'drop';
-            const climaxStarts = moods[b].state === 'climax' && !lifted(b - 1);
-            if (!drop && !climaxStarts) continue;
+            const climaxStarts = moods[b].state === 'climax' && lifted(b + 1) && !lifted(b - 1) && !lifted(b - 2);
+            if ((!drop && !climaxStarts) || b - lastRunway < 8) continue;
+            lastRunway = b;
             const to = slotOf(moods[b].start);
             // above EZ the run-up closes both hands in on the centre, so they burst out to the chord on the drop
             lay('runway', to - runwaySlots, to, options.difficulty === 'EZ' ? ['cross', 'arc'] : ['converge']);
@@ -1068,6 +1148,102 @@ export const generateChart = (analysis: AudioAnalysis, options: GeneratorOptions
     const tripleRate = style.triple[options.difficulty];
     if (tripleRate) {
         for (const i of takeTop(notes.map((_, i) => i), total, tripleRate, i => notes[i].strength, i => notes[i].chord && notes[i].type === 1)) notes[i].triple = true;
+    }
+
+    // the instrument: notes go where a player of it would play them, so the chart feels played rather than
+    // tapped. on keys every note has its own key across the screen (the song's pitches spread low to high,
+    // left to right, the same pitch always on the same spot): the left hand plays the bass, the right the
+    // melody, a bass note struck with a melody note is a chord of both hands, and a quick run up or down the
+    // keys (a scale, an arpeggio) is one hand sliding along them as drags. on drums the kick sits under the
+    // left hand, the snare under the right and the cymbals at the right edge; a kick with a snare is a chord
+    // and a quick roll of hi-hats or snare is a slide. drag streams, flicks and holds play on top, for fun
+    if (playStyle !== 'free') {
+        const { highEnvelope, bassPitch } = analysis;
+        const edge = profile.spread - 0.5;
+        const peakNear = (values: Float32Array, slot: number) => {
+            const center = frameAt(slotTime(slot));
+            let peak = 0;
+            for (let f = center - tolerance; f <= center + tolerance; f++) peak = Math.max(peak, valueAt(values, f));
+            return peak;
+        };
+        const settledBass = (slot: number) => {
+            const start = frameAt(slotTime(slot));
+            const values = [];
+            for (let f = start + 1; f <= start + Math.max(3, Math.round(0.1 / frameSeconds)); f++) values.push(valueAt(bassPitch, f));
+            values.sort((a, b) => a - b);
+            return values[values.length >> 1];
+        };
+        const strength = notes.map(n => ({ bass: peakNear(bassEnvelope, n.slot), high: peakNear(highEnvelope, n.slot), all: peakNear(envelope, n.slot) }));
+        // chords the instrument asks for (a bass under a melody note, a kick under a snare), the strongest
+        // first, up to a little over the difficulty's usual share of chords
+        const wanted: { i: number; x: number; score: number }[] = [];
+        // a bass onset strong enough to be its own note under the melody (on beats, where a left hand plays it)
+        const bassUnder = (i: number) => strength[i].bass >= 0.5 && strength[i].bass >= 0.6 * strength[i].all && notes[i].slot % sub === 0;
+        if (playStyle === 'keys') {
+            // a note led by the bass is a left-hand bass note
+            const bassLed = notes.map((_, i) => strength[i].bass > 1.3 * strength[i].all);
+            const keyPitch = notes.map((n, i) => (bassLed[i] ? settledBass(n.slot) : n.pitch));
+            // the keyboard spans the song's range (its lowest and highest twentieth left out), evenly in
+            // semitones, so a step up the scale is a step to the right and an octave always the same distance
+            const sorted = [...keyPitch, ...notes.filter((_, i) => bassUnder(i)).map(n => settledBass(n.slot))].sort((a, b) => a - b);
+            const low = sorted[Math.floor(0.05 * (sorted.length - 1))] ?? 0;
+            const high = Math.max(low + 1, sorted[Math.floor(0.95 * (sorted.length - 1))] ?? 0);
+            const keyX = (value: number) => -edge + 2 * edge * Math.min(1, Math.max(0, (value - low) / (high - low)));
+            notes.forEach((note, i) => {
+                const x = keyX(keyPitch[i]);
+                note.keyX = bassLed[i] ? Math.min(x, -1) : x;
+                note.keyHand = bassLed[i] || x < 0 ? 0 : 1;
+                // a melody note over a bass note on the beat: both hands, as on a piano
+                if (!bassLed[i] && bassUnder(i) && note.type !== 3 && note.keyX > 1) {
+                    wanted.push({ i, x: Math.min(-1, keyX(settledBass(note.slot))), score: strength[i].bass });
+                }
+            });
+        } else {
+            // the kit: kick (two pedals' worth of spots), snare, cymbals
+            notes.forEach((note, i) => {
+                const { bass, high, all } = strength[i];
+                const kick = bass >= high && bass >= 0.8 * all;
+                const cymbal = !kick && high > 1.2 * Math.max(bass, all - high);
+                note.keyX = kick ? (note.slot % (2 * sub) === 0 ? -3.5 : -2) : cymbal ? edge : 2.5;
+                note.keyHand = kick ? 0 : 1;
+                // a kick under a snare hit on the beat: both hands
+                if (!kick && bass >= 0.5 && note.slot % sub === 0 && note.type !== 3) wanted.push({ i, x: -3.5, score: bass });
+            });
+        }
+        if (options.difficulty !== 'EZ') {
+            let chordCount = notes.filter(n => n.chord).length;
+            const allowed = Math.round(notes.length * chordRate * 1.4);
+            // downbeats first, then the strongest
+            for (const { i, x } of wanted.sort((a, b) => (notes[b.i].slot % (4 * sub) === 0 ? 1 : 0) - (notes[a.i].slot % (4 * sub) === 0 ? 1 : 0) || b.score - a.score)) {
+                const note = notes[i];
+                if (!note.chord) {
+                    if (chordCount >= allowed) continue;
+                    chordCount++;
+                    note.chord = true;
+                    note.partnerType = note.partnerType ?? 1;
+                }
+                note.partnerX = x;
+            }
+        }
+        // quick runs over the keys (or a roll on one drum) become one hand sliding: three or more notes in
+        // quick succession on the same hand's side, all moving the same way (or staying)
+        for (let i = 0; i < notes.length; ) {
+            let j = i;
+            while (j + 1 < notes.length && slotTime(notes[j + 1].slot) - slotTime(notes[j].slot) <= RUN_SECONDS
+                && notes[j + 1].keyHand === notes[i].keyHand && notes[j + 1].type !== 3 && notes[j].type !== 3) j++;
+            const run = notes.slice(i, j + 1);
+            const steps = run.slice(1).map((n, k) => Math.sign(Math.round((n.keyX! - run[k].keyX!) * 2)));
+            const oneWay = steps.every(d => d >= 0) || steps.every(d => d <= 0);
+            if (run.length >= 3 && oneWay && run.some((n, k) => k > 0 && n.keyX !== run[k - 1].keyX)) {
+                for (const n of run) {
+                    if (n.type === 1) {
+                        n.type = 2;
+                        n.chord = false;
+                    }
+                }
+            }
+            i = j + 1;
+        }
     }
 
     const motion = options.lineMotion === false ? undefined : buildLineMotion(analysis, {
@@ -1397,6 +1573,13 @@ export const generateChart = (analysis: AudioAnalysis, options: GeneratorOptions
         } else {
             figure = null;
         }
+        // the instrument puts the note on its key (or drum), for the hand that plays there
+        if (note.keyX !== undefined && note.sweepX === undefined) {
+            wantX = note.keyX;
+            wantHand = note.keyHand ?? null;
+            wantAlong = null;
+            figure = null;
+        }
         // a drag stream follows its path across the screen, hand by hand
         if (note.sweepX !== undefined && note.type === 2) {
             wantX = note.sweepX;
@@ -1509,12 +1692,13 @@ export const generateChart = (analysis: AudioAnalysis, options: GeneratorOptions
                 const accepts = (x: number) => ok(x) && distance(pointAt(pf, x), q) >= 3.5;
                 // a third of official chords mirror about the centre of the screen
                 // (along the line when both notes are on it, since the line itself may be off-centre)
-                const mirrored = Math.abs(pf.ux) >= 0.5 && Math.abs(found.p) >= 1.75 && random() < 0.75
+                const mirrored = note.partnerX === undefined && Math.abs(pf.ux) >= 0.5 && Math.abs(found.p) >= 1.75 && random() < 0.75
                     ? (pf.line === f.line ? -found.p : (-q.x - pf.cx) / pf.ux)
                     : null;
                 const p = mirrored !== null && mirrored >= low && mirrored <= high && accepts(mirrored)
                     ? mirrored
-                    : findSpot(towards(pf, (other === 1 ? 1 : -1) * (4 + random() * 4)), low, high, accepts);
+                    : findSpot(note.partnerX !== undefined && Math.abs(pf.ux) >= 0.5 ? (note.partnerX - pf.cx) / pf.ux
+                        : towards(pf, (other === 1 ? 1 : -1) * (4 + random() * 4)), low, high, accepts);
                 if (p !== null) partner = { hand: other, f: pf, p };
             }
             if (!partner && style.fingers > 1 && busyFingers(hand, partnerType, time).length + 1 < style.fingers) {
@@ -1715,6 +1899,7 @@ export const generateChart = (analysis: AudioAnalysis, options: GeneratorOptions
         motion,
         choreography,
         streams,
+        playStyle,
         hands: plannedHands,
         level: Math.round(Math.min(16.9, rateNotes(officialNotes.map(n => ({ time: toSeconds(n.time), type: n.type }))) + LEVEL_CALIBRATION[options.difficulty]) * 10) / 10,
         speed: {

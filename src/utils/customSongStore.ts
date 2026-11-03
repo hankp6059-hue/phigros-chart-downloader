@@ -2,7 +2,7 @@
 // dialog, so a song can be reopened, played and exported later. charts are not stored: they are generated
 // again on opening (the generator is deterministic for the same song and settings).
 
-import type { FingeringStyle, GeneratorDifficulty } from './chartGenerator';
+import type { FingeringStyle, GeneratorDifficulty, PlayStyle } from './chartGenerator';
 
 export interface SavedSong {
     id: string;
@@ -19,6 +19,8 @@ export interface SavedSong {
     fingering: FingeringStyle;
     /** which staging of the judgment-line performances was picked (missing in songs saved before: 0) */
     stagingSeed?: number;
+    /** what the notes are laid out like (missing in songs saved before: 'auto') */
+    playStyle?: PlayStyle | 'auto';
     audio: Blob;
     audioName: string;
     cover: Blob | null;

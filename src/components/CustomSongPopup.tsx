@@ -17,7 +17,10 @@ import {
     FingeringStyle,
     GENERATOR_DIFFICULTIES,
     GeneratorDifficulty,
+    PLAY_STYLES,
+    PlayStyle,
     StreamPath,
+    detectPlayStyle,
     analyzeAudio,
     generateChart,
 } from '../utils/chartGenerator';
@@ -40,6 +43,13 @@ const MOOD_COLORS: Record<BarState, string> = {
     silent: '#334155', calm: '#60a5fa', groove: '#2dd4bf', build: '#fbbf24', drop: '#f43f5e', climax: '#e879f9',
 };
 
+const PLAY_STYLE_LABELS: Record<PlayStyle | 'auto', string> = { auto: '自动', keys: '键盘', drums: '鼓', free: '自由' };
+const PLAY_STYLE_HINTS: Record<PlayStyle | 'auto', string> = {
+    auto: '按音色自动选：钢琴、人声、合成器等有音高的选键盘，打击乐为主的选鼓',
+    keys: '像弹钢琴：低音在左、高音在右，同一个音总在同一个位置；左手弹低音、右手弹旋律，同时响起就是双押，快速音阶和琶音是同一只手的黄键滑奏',
+    drums: '像打鼓：左手底鼓、右手军鼓、最右边是镲；底鼓和军鼓同时响就是双押，滚奏是滑键，冲刺是从右往左的鼓花',
+    free: '不按乐器排位，只跟旋律起伏和键型（之前的排法）',
+};
 const FINGERING_LABELS: Record<FingeringStyle, string> = { single: '双手单指', multi: '双手多指' };
 const FINGERING_HINTS: Record<FingeringStyle, string> = {
     single: '手机双拇指：每只手一个手指，快速连打左右交互',
@@ -51,7 +61,7 @@ const MOTIF_LABELS: Record<Motif, string> = {
     flyIn: '飞入', mirror: '镜像', pendulum: '钟摆', converge: '汇聚', shatter: '碎裂', pulse: '闪线',
     spiral: '螺旋', lattice: '网格', ripple: '涟漪', scissor: '剪刀',
 };
-const STREAM_LABELS: Record<StreamPath, string> = { cross: '横扫', converge: '双手收拢', arc: '弧线', wave: '波浪' };
+const STREAM_LABELS: Record<StreamPath, string> = { cross: '横扫', converge: '双手收拢', arc: '弧线', wave: '波浪', keys: '沿琴键', roll: '鼓花' };
 const EASE_LABELS: Record<Ease, string> = { smooth: '平滑', out: '急起缓停', in: '缓起急停', sine: '柔和', linger: '停顿' };
 const ENTRY_LABELS: Record<Entry, string> = { fade: '淡入', slide: '横移', drop: '落下', rise: '升起', unfold: '展开', turn: '转入' };
 
@@ -125,6 +135,7 @@ export const CustomSongPopup: React.FC<CustomSongPopupProps> = ({ isOpen, onClos
     // which staging of the judgment-line performances; changing it restages them and leaves the notes
     const [stagingSeed, setStagingSeed] = useState(0);
     const [fingering, setFingering] = useState<FingeringStyle>('single');
+    const [playStyle, setPlayStyle] = useState<PlayStyle | 'auto'>('auto');
 
     // songs saved in this browser; `savedId` is the one open (saving again updates it)
     const [savedSongs, setSavedSongs] = useState<SavedSongSummary[]>([]);
@@ -192,10 +203,10 @@ export const CustomSongPopup: React.FC<CustomSongPopupProps> = ({ isOpen, onClos
         }
     };
 
-    const snapshot = (values: { name: string; composer: string; charter: string; difficulty: string; levelOverride: string | null; bpm: string; offsetMs: string; lineMotion: boolean; speedChanges: boolean; fingering: string; stagingSeed?: number; cover: Blob | null }) =>
+    const snapshot = (values: { name: string; composer: string; charter: string; difficulty: string; levelOverride: string | null; bpm: string; offsetMs: string; lineMotion: boolean; speedChanges: boolean; fingering: string; stagingSeed?: number; playStyle?: string; cover: Blob | null }) =>
         JSON.stringify([values.name, values.composer, values.charter, values.difficulty, values.levelOverride, values.bpm, values.offsetMs,
-            values.lineMotion, values.speedChanges, values.fingering, values.stagingSeed ?? 0, values.cover ? values.cover.size : null]);
-    const currentSnapshot = snapshot({ name: name.trim() || '未命名', composer: composer.trim(), charter: charter.trim(), difficulty, levelOverride, bpm: bpmInput, offsetMs: offsetInput, lineMotion, speedChanges, fingering, stagingSeed, cover: coverFile });
+            values.lineMotion, values.speedChanges, values.fingering, values.stagingSeed ?? 0, values.playStyle ?? 'auto', values.cover ? values.cover.size : null]);
+    const currentSnapshot = snapshot({ name: name.trim() || '未命名', composer: composer.trim(), charter: charter.trim(), difficulty, levelOverride, bpm: bpmInput, offsetMs: offsetInput, lineMotion, speedChanges, fingering, stagingSeed, playStyle, cover: coverFile });
 
     const handleSave = async () => {
         if (!audioFile) return;
@@ -216,6 +227,7 @@ export const CustomSongPopup: React.FC<CustomSongPopupProps> = ({ isOpen, onClos
                 speedChanges,
                 fingering,
                 stagingSeed,
+                playStyle,
                 audio: audioFile,
                 audioName: audioFile.name,
                 cover: coverFile,
@@ -248,6 +260,7 @@ export const CustomSongPopup: React.FC<CustomSongPopupProps> = ({ isOpen, onClos
             setSpeedChanges(song.speedChanges);
             setFingering(song.fingering);
             setStagingSeed(song.stagingSeed ?? 0);
+            setPlayStyle(song.playStyle ?? 'auto');
             setCoverFile(song.cover ? new File([song.cover], song.coverName ?? 'cover.png', { type: song.cover.type }) : null);
             await handleAudio(new File([song.audio], song.audioName, { type: song.audio.type }), { bpm: song.bpm, offsetMs: song.offsetMs });
         } catch (e) {
@@ -286,6 +299,7 @@ export const CustomSongPopup: React.FC<CustomSongPopupProps> = ({ isOpen, onClos
         setOffsetInput('0');
         setShowPreview(false);
         setStagingSeed(0);
+        setPlayStyle('auto');
         setError(null);
     };
 
@@ -307,8 +321,10 @@ export const CustomSongPopup: React.FC<CustomSongPopupProps> = ({ isOpen, onClos
             speedChanges,
             fingering,
             stagingSeed,
+            playStyle,
         })])) as Record<GeneratorDifficulty, ReturnType<typeof generateChart>>;
-    }, [analysis, bpmValid, bpm, offsetMs, name, audioFile, lineMotion, speedChanges, fingering, stagingSeed]);
+    }, [analysis, bpmValid, bpm, offsetMs, name, audioFile, lineMotion, speedChanges, fingering, stagingSeed, playStyle]);
+    const detectedStyle = useMemo(() => (analysis ? detectPlayStyle(analysis).style : null), [analysis]);
     const generated = charts?.[difficulty] ?? null;
 
     const level = levelOverride ?? (generated ? String(generated.level) : '');
@@ -499,6 +515,21 @@ export const CustomSongPopup: React.FC<CustomSongPopupProps> = ({ isOpen, onClos
                             ))}
                             <span className="text-[12px] text-slate-500">{FINGERING_HINTS[fingering]}</span>
                         </div>
+                        <div className="flex flex-wrap items-center gap-2 text-[13px] text-slate-300">
+                            演奏方式
+                            {(['auto', ...PLAY_STYLES] as const).map(style => (
+                                <button
+                                    key={style}
+                                    type="button"
+                                    title={PLAY_STYLE_HINTS[style]}
+                                    onClick={() => setPlayStyle(style)}
+                                    className={`h-8 px-3 rounded-lg border text-[13px] transition-colors ${playStyle === style ? 'border-[#22d3ee]/60 bg-[#22d3ee]/10 text-white' : 'border-white/[.08] bg-white/[.04] text-slate-400 hover:text-slate-200'}`}
+                                >
+                                    {style === 'auto' && detectedStyle ? `自动（${PLAY_STYLE_LABELS[detectedStyle]}）` : PLAY_STYLE_LABELS[style]}
+                                </button>
+                            ))}
+                            <span className="text-[12px] text-slate-500">{PLAY_STYLE_HINTS[playStyle === 'auto' && detectedStyle ? detectedStyle : playStyle]}</span>
+                        </div>
                         <label className="flex items-center gap-2 text-[13px] text-slate-300">
                             <input type="checkbox" checked={lineMotion} onChange={e => setLineMotion(e.target.checked)} className="accent-[#22d3ee]" />
                             判定线随歌曲情绪运动
@@ -562,7 +593,7 @@ export const CustomSongPopup: React.FC<CustomSongPopupProps> = ({ isOpen, onClos
                 <p className="text-[12px] leading-[1.6] text-slate-500 text-pretty">
                     音符放在哪里，由一个从 240 首官方谱面（曲库的 73%）里学到的模型决定，模仿谱师的取舍。键位按官方谱面的双手习惯来排，可选「双手单指」（手机双拇指）或「双手多指」（平板，每只手三指）：左手负责左半屏、右手负责右半屏，两手永不交叉；
                     快于单手连打的音符左右交互，慢一些时旋律上行交给右手、下行交给左手，每只手顺着旋律从上一个位置移动，移动距离不超过手指在这段时间里能到达的范围；
-                    双押一手一个，Hold 由一只手按住时其余音符全部交给另一只手，音符之间不会重叠。键型的排布参照 96 张官方谱面：红色 Flick 落在重拍和乐句结尾，常成对出现或接在一串 Drag 后面（滑后划）；Flick 之后 0.3 秒内附近不放 Tap / Hold，避免划键时误触，紧跟的多是 Flick 或 Drag。黄色 Drag 是轻打和快速连音，连成一条随旋律扫动的线；双押会混搭键型（Drag+Tap、Hold+Tap、Flick+Tap、双 Flick），
+                    双押一手一个，Hold 由一只手按住时其余音符全部交给另一只手，音符之间不会重叠。「演奏方式」让谱面像在演奏乐器：键盘方式下每个音有自己的琴键位置（低音在左、高音在右），左手弹低音、右手弹旋律，快速音阶和琶音是一只手的黄键滑奏；鼓方式下左手底鼓、右手军鼓和镲；高潮前的黄键冲刺也跟着乐器走（沿琴键滑，或从右往左的鼓花）。键型的排布参照 96 张官方谱面：红色 Flick 落在重拍和乐句结尾，常成对出现或接在一串 Drag 后面（滑后划）；Flick 之后 0.3 秒内附近不放 Tap / Hold，避免划键时误触，紧跟的多是 Flick 或 Drag。黄色 Drag 是轻打和快速连音，连成一条随旋律扫动的线；双押会混搭键型（Drag+Tap、Hold+Tap、Flick+Tap、双 Flick），
                     持续的长音是 Hold，其余是蓝色 Tap。流速跟着段落走：平缓、静默段放慢，铺垫段逐拍加速，爆发和高潮段提速（EZ 变化更小）。额外的判定线按段落、重音和歌曲风格编排演出（接力、分线、扇形、交叉、旋转、碎裂等），每首歌都不同，同一首歌重复的段落会以镜像重现；Hard 及以上，接力时一条倾斜的副线飞入接手整段乐句、主线变暗，分线时右手音符走上面的线、左手走下面的线，副线上的音符在屏幕上的左右位置和指法都不变。主判定线按每小节的情绪运动：平缓处呼吸、律动处摇摆、铺垫时蓄力倾斜、爆发时回正下砸，
                     高潮的动法由歌曲本身的明亮度、密度和旋律起伏混合而成。物量和各种键的比例参照官方同难度谱面的中位数；定数由官方 516 张谱面拟合的公式自动评出（平均误差约 ±1）。
                     如果试听时打击音和节拍对不上，请修改 BPM 或偏移（正数让音符更晚出现）。导出格式与原程序一致，遵循设置里的「ZIP 格式」和「谱面格式转换」选项。
