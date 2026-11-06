@@ -568,6 +568,8 @@ const drawNotes = (
             drawNoteHead(g, 3, lx, -head, noteWidth, noteHeight, multi.has(note));
             continue;
         }
+        // a previewed note is gone once it is hit (the burst stands in for it)
+        if (options.previewHits && seconds >= hitSeconds) continue;
         const distance = (note.floorPosition - currentFloor) * floorScale;
         if (distance > height * 2) continue;
         drawNoteHead(g, note.type, lx, -distance, noteWidth, noteHeight, multi.has(note));

@@ -19,7 +19,7 @@ export interface SavedSong {
     fingering: FingeringStyle;
     /** which staging of the judgment-line performances was picked (missing in songs saved before: 0) */
     stagingSeed?: number;
-    /** what the notes are laid out like (missing in songs saved before: 'auto') */
+    /** what the notes are laid out like (missing in songs saved before, or 'auto' from an earlier version: keys) */
     playStyle?: PlayStyle | 'auto';
     audio: Blob;
     audioName: string;

@@ -21,18 +21,6 @@ export type PlayStyle = 'keys' | 'drums' | 'free';
 
 export const PLAY_STYLES: PlayStyle[] = ['keys', 'drums', 'free'];
 
-/** spectral flatness above which a song reads as drums rather than a tuned instrument */
-const DRUM_FLATNESS = 0.3;
-
-/** Whether a song sounds more like a tuned instrument (piano, voice, synth) or like drums, from how noisy its loud parts are. */
-export const detectPlayStyle = (analysis: AudioAnalysis): { style: 'keys' | 'drums'; flatness: number } => {
-    const values: number[] = [];
-    for (let f = 0; f < analysis.flatness.length; f++) if (analysis.loudness[f] > 0.25) values.push(analysis.flatness[f]);
-    values.sort((a, b) => a - b);
-    const flatness = values.length ? values[values.length >> 1] : 0;
-    return { style: flatness > DRUM_FLATNESS ? 'drums' : 'keys', flatness };
-};
-
 /** how the chart is meant to be played: one finger per hand (two thumbs, on a phone) or several (on a tablet) */
 export type FingeringStyle = 'single' | 'multi';
 
@@ -62,8 +50,6 @@ export interface AudioAnalysis {
     bassPitch: Float32Array;
     /** onset strength above ~5 kHz (hi-hats, cymbals, snare rattle), roughly 0..1 */
     highEnvelope: Float32Array;
-    /** spectral flatness per frame, 0 (pure tones) .. 1 (noise): drums sound flat, pianos and voices peaked */
-    flatness: Float32Array;
     bpm: number;
     /** time of the first beat on the detected grid, in seconds (0 <= firstBeat < beat length) */
     firstBeat: number;
@@ -85,8 +71,8 @@ export interface GeneratorOptions {
     fingering?: FingeringStyle;
     /** 0 for the song's first staging of extra judgment lines; another number stages it anew (notes stay) */
     stagingSeed?: number;
-    /** what the notes are laid out like (default 'auto': keys or drums, by the sound) */
-    playStyle?: PlayStyle | 'auto';
+    /** what the notes are laid out like (default 'keys') */
+    playStyle?: PlayStyle;
 }
 
 export interface GeneratedChart {
@@ -99,6 +85,8 @@ export interface GeneratedChart {
     streams: DragStream[];
     /** what the notes were laid out like */
     playStyle: PlayStyle;
+    /** pictures drawn with notes */
+    figures: { squares: number; rings: number };
     /** the hand (0 left, 1 right) planned for each note, per judgment line in the chart's note order */
     hands: number[][];
     /** difficulty constant on the official scale */
@@ -206,9 +194,6 @@ export const analyzeAudio = (channels: Float32Array[], sampleRate: number, tempo
     const bassFlux = new Float32Array(frameCount);
     const highFlux = new Float32Array(frameCount);
     const highBin = Math.min(bins - 1, Math.round((5000 * fftSize) / sampleRate));
-    const flatFrom = Math.max(1, Math.round((100 * fftSize) / sampleRate));
-    const flatTo = Math.min(bins - 1, Math.round((8000 * fftSize) / sampleRate));
-    const flatness = new Float32Array(frameCount);
     const bassPitch = new Float32Array(frameCount);
     const bassLow = Math.max(1, Math.round((40 * pitchSize) / sampleRate));
     const bassHigh = Math.round((250 * pitchSize) / sampleRate);
@@ -243,26 +228,18 @@ export const analyzeAudio = (channels: Float32Array[], sampleRate: number, tempo
         let sum = 0;
         let weighted = 0;
         let total = 0;
-        let logSum = 0;
-        let linearSum = 0;
         for (let k = 1; k < bins; k++) {
             const magnitude = Math.hypot(re[k], im[k]);
             current[k] = Math.log1p(100 * magnitude);
             if (f > 0) sum += Math.max(0, current[k] - previous[k]);
             if (k === bassBins) bassFlux[f] = sum;
             if (k === highBin) highFlux[f] = -sum;
-            if (k >= flatFrom && k <= flatTo) {
-                logSum += Math.log(magnitude + 1e-9);
-                linearSum += magnitude;
-            }
             weighted += k * magnitude;
             total += magnitude;
             if (k <= lowBins) lowLevel[f] += magnitude * magnitude;
         }
         flux[f] = sum;
         highFlux[f] += sum;
-        const flatBins = flatTo - flatFrom + 1;
-        flatness[f] = linearSum > 1e-6 ? Math.exp(logSum / flatBins) / (linearSum / flatBins) : 1;
         brightness[f] = Math.log2(Math.max(1, (weighted / Math.max(total, 1e-9)) * (sampleRate / fftSize)));
 
         const pitchOffset = offset + fftSize / 2 - pitchSize / 2;
@@ -403,7 +380,6 @@ export const analyzeAudio = (channels: Float32Array[], sampleRate: number, tempo
         lowLevel,
         bassPitch,
         highEnvelope,
-        flatness,
         bpm,
         firstBeat,
     };
@@ -620,10 +596,26 @@ interface PlannedNote {
     keyHand?: number;
     /** where the instrument puts a chord's other note (the bass under a melody note, the kick under a snare) */
     partnerX?: number;
+    /** the hold this flick ends, on its spot */
+    tailOf?: PlannedNote;
+}
+
+/** a picture drawn with notes on invisible lines of its own, closing on one spot */
+interface NoteFigure {
+    kind: 'square' | 'ring';
+    /** seconds: when it has flown in, and when its notes meet */
+    from: number;
+    hit: number;
+    /** where they meet (0..1 across and up the screen) */
+    x: number;
+    y: number;
+    /** degrees: how it stands, and how far it turns from `from` to `hit` */
+    angle: number;
+    spin: number;
 }
 
 /** the path a drag stream's notes follow across the screen */
-export type StreamPath = 'cross' | 'converge' | 'arc' | 'wave' | 'keys' | 'roll';
+export type StreamPath = 'cross' | 'converge' | 'arc' | 'wave' | 'keys' | 'roll' | 'ladder' | 'twin';
 
 export interface DragStream {
     /** 'runway': the run-up into a drop or a climax; 'fill': the end of a climax phrase into the next */
@@ -1025,9 +1017,10 @@ export const generateChart = (analysis: AudioAnalysis, options: GeneratorOptions
     // downbeat with a flick, chorded above EZ; and in a climax, the last two beats of a phrase slide into the
     // next phrase's downbeat. each stream follows one path across the screen: one sweep from side to side,
     // both hands closing in on the centre, one hand arching in and out, or a wave
-    const playStyle: PlayStyle = !options.playStyle || options.playStyle === 'auto' ? detectPlayStyle(analysis).style : options.playStyle;
+    const playStyle: PlayStyle = options.playStyle ?? 'keys';
     const moods = readBarMoods(analysis, options.bpm, firstBeat);
     const streams: DragStream[] = [];
+    const figures: NoteFigure[] = [];
     {
         // stream notes come a sixteenth apart (an eighth on EZ and HD)
         const step = options.difficulty === 'EZ' || options.difficulty === 'HD' ? Math.max(1, Math.round(sub / 2)) : Math.max(1, Math.round(sub / 4));
@@ -1048,6 +1041,16 @@ export const generateChart = (analysis: AudioAnalysis, options: GeneratorOptions
                 }
                 case 'arc':
                     return [dir * (edge - (edge - 1) * Math.sin(Math.PI * u)), dir > 0 ? 1 : 0];
+                case 'ladder': {
+                    // two columns, one under each hand, climbing straight up the screen
+                    const side = i % 2 ? 1 : -1;
+                    return [side * 2.5, side > 0 ? 1 : 0];
+                }
+                case 'twin': {
+                    // both hands sliding the same way, side by side, as two parallel stairs
+                    const side = i % 2 ? 1 : -1;
+                    return [side * 3 + dir * (2 * u - 1) * 1.75, side > 0 ? 1 : 0];
+                }
                 case 'wave':
                 default:
                     return [dir * ((1 + edge) / 2 + ((edge - 1) / 2) * Math.sin(2 * Math.PI * waves * u)), dir > 0 ? 1 : 0];
@@ -1059,6 +1062,10 @@ export const generateChart = (analysis: AudioAnalysis, options: GeneratorOptions
         const keyFloor = noteStrengths[Math.floor(0.3 * (noteStrengths.length - 1))] ?? 0;
         const lay = (kind: DragStream['kind'], from: number, to: number, paths: StreamPath[]) => {
             from = Math.max(0, from);
+            // the instrument decides the path, but a climax phrase may end in a show of hands instead
+            const showy = kind === 'fill' && playStyle !== 'free' && random() < 0.35;
+            const path: StreamPath = showy ? (random() < 0.5 ? 'ladder' : 'twin')
+                : playStyle === 'keys' ? 'keys' : playStyle === 'drums' ? 'roll' : paths[Math.floor(random() * paths.length)];
             if (to > slotCount || to - from < 2 * step) return false;
             for (let s = from; s <= to; s++) if (inStream[s]) return false;
             // a hold reaching into the run keeps it from being one slide
@@ -1066,7 +1073,7 @@ export const generateChart = (analysis: AudioAnalysis, options: GeneratorOptions
             // the slide stops a step before the downbeat, so the hands are up again to hit it together
             const stop = to - step;
             const slots = new Set<number>();
-            for (let s = from; s < stop; s += step) if (active[s] && (playStyle !== 'keys' || strengths[s] >= keyFloor)) slots.add(s);
+            for (let s = from; s < stop; s += step) if (active[s] && (path !== 'keys' || strengths[s] >= keyFloor)) slots.add(s);
             for (const n of notes) if (n.slot >= from && n.slot < stop) slots.add(n.slot);
             const ordered = [...slots].sort((a, b) => a - b);
             // too little sounding there for a stream
@@ -1088,7 +1095,6 @@ export const generateChart = (analysis: AudioAnalysis, options: GeneratorOptions
             });
             // the slide goes the way the melody goes
             const dir = stream[stream.length - 1].pitch >= stream[0].pitch ? 1 : -1;
-            const path = playStyle === 'keys' ? 'keys' : playStyle === 'drums' ? 'roll' : paths[Math.floor(random() * paths.length)];
             const waves = stream.length >= 8 ? 2 : 1;
             // (on keys the notes keep their keys, set below)
             if (path !== 'keys') {
@@ -1139,9 +1145,54 @@ export const generateChart = (analysis: AudioAnalysis, options: GeneratorOptions
             if (runStart < 0) runStart = b;
             if ((b - runStart) % 4 !== 3 || !lifted(b + 1) || random() >= fillRate) continue;
             const to = slotOf(moods[b + 1].start);
-            lay('fill', to - 2 * sub, to, ['cross', 'converge', 'arc', 'wave']);
+            lay('fill', to - 2 * sub, to, ['cross', 'converge', 'arc', 'wave', 'ladder', 'twin']);
         }
         notes.sort((a, b) => a.slot - b.slot);
+
+        // figures: pictures drawn with the notes themselves, on invisible lines of their own. a bar of plain
+        // beats (not a climax) becomes a walk of squares, one closing on each beat, and a long enough intro
+        // ends in a ring closing on the first note. all the notes of a figure meet on one spot, so one finger
+        // takes them, and it can slide from square to square; nothing else plays meanwhile
+        const walks = options.lineMotion === false ? 0 : { EZ: 0, HD: 1, IN: 2, AT: 3 }[options.difficulty];
+        const clearOfHolds = (from: number, to: number) => !notes.some(n => n.type === 3 && n.slot < to && n.slot + n.holdSlots > from);
+        const free = (from: number, to: number) => {
+            for (let s = Math.max(0, from); s <= to && s <= slotCount; s++) if (inStream[s]) return false;
+            return clearOfHolds(from, to);
+        };
+        const margin = Math.ceil(0.25 / slotSeconds);
+        const barHits = moods.map((mood, b) => {
+            const first = slotOf(mood.start);
+            const hits = [0, 1, 2, 3].map(k => first + k * sub);
+            const plain = mood.state === 'calm' || mood.state === 'groove' || mood.state === 'build';
+            // well after the first note: the opening ring shares the walks' lines
+            const usable = plain && notes.length > 0 && first >= notes[0].slot + 16 * sub && hits[3] < slotCount && hits.every(s => active[s]) && free(first - margin, hits[3] + margin);
+            return { b, hits, score: usable ? hits.reduce((sum, s) => sum + strengths[s], 0) : -1 };
+        }).filter(c => c.score > 0).sort((x, y) => y.score - x.score);
+        const chosen: typeof barHits = [];
+        for (const c of barHits) {
+            if (chosen.length < walks && chosen.every(o => Math.abs(o.b - c.b) >= 16)) chosen.push(c);
+        }
+        for (const { hits } of chosen) {
+            // the walk runs up the screen from one side to the other
+            const side = random() < 0.5 ? 1 : -1;
+            const tilt = random() < 0.5 ? 0 : 15 + 30 * random();
+            const spin = (random() < 0.5 ? -1 : 1) * 30 * random();
+            hits.forEach((slot, i) => figures.push({
+                kind: 'square',
+                from: slotTime(hits[0]) - 2 * beat,
+                hit: slotTime(slot),
+                x: 0.5 + side * (i / 3 - 0.5) * 0.5,
+                y: 0.32 + (i / 3) * 0.36,
+                angle: tilt,
+                spin,
+            }));
+            const [from, to] = [hits[0] - margin, hits[3] + margin];
+            notes.splice(0, notes.length, ...notes.filter(n => n.slot < from || n.slot > to));
+        }
+        if (notes.length && options.lineMotion !== false && options.difficulty !== 'EZ' && slotTime(notes[0].slot) >= 8 * beat && notes[0].type !== 3) {
+            figures.push({ kind: 'ring', from: slotTime(notes[0].slot) - 6 * beat, hit: slotTime(notes[0].slot), x: 0.5, y: 0.5, angle: 0, spin: 45 });
+            notes.shift();
+        }
     }
 
     // with several fingers the strongest chords take a third note
@@ -1244,6 +1295,27 @@ export const generateChart = (analysis: AudioAnalysis, options: GeneratorOptions
             }
             i = j + 1;
         }
+    }
+
+    // a hold often ends in a flick on the same spot: the finger lets go with a swipe, on the beat. a hold of half
+    // a beat or more qualifies, drawn out to the next half beat if it stops short and nothing is in the way
+    const tailRate = { EZ: 0, HD: 0.2, IN: 0.25, AT: 0.3 }[options.difficulty];
+    {
+        const half = Math.max(1, Math.round(sub / 2));
+        const taken = new Set(notes.map(n => n.slot));
+        const clearBetween = (from: number, to: number) => {
+            for (let s = from; s <= to; s++) if (taken.has(s)) return false;
+            return true;
+        };
+        for (const hold of notes.filter(n => n.type === 3 && n.holdSlots >= half)) {
+            const end = hold.slot + hold.holdSlots;
+            const slot = Math.ceil(end / half) * half;
+            if (slot >= slotCount || !clearBetween(end, slot + half - 1) || taken.has(slot - half + 1) || random() >= tailRate) continue;
+            hold.holdSlots = slot - hold.slot;
+            taken.add(slot);
+            notes.push({ slot, strength: strengths[slot], pitch: hold.pitch, type: 4, holdSlots: 0, x: 0, line: -1, sx: 0, sy: 0, chord: false, tailOf: hold });
+        }
+        notes.sort((a, b) => a.slot - b.slot);
     }
 
     const motion = options.lineMotion === false ? undefined : buildLineMotion(analysis, {
@@ -1580,6 +1652,13 @@ export const generateChart = (analysis: AudioAnalysis, options: GeneratorOptions
             wantAlong = null;
             figure = null;
         }
+        // a hold's flick lands where the hold was, under the finger letting go
+        if (note.tailOf) {
+            wantX = note.tailOf.sx;
+            wantHand = note.tailOf.hand ?? null;
+            wantAlong = { line: note.tailOf.line, p: note.tailOf.x };
+            figure = null;
+        }
         // a drag stream follows its path across the screen, hand by hand
         if (note.sweepX !== undefined && note.type === 2) {
             wantX = note.sweepX;
@@ -1590,7 +1669,8 @@ export const generateChart = (analysis: AudioAnalysis, options: GeneratorOptions
         // figures land on the half-unit grid, so their steps stay even
         if (wantX !== null) wantX = Math.round(wantX * 2) / 2;
 
-        let playable = [0, 1].filter(h => canPlay(h, note.type, time));
+        const tailHand = note.tailOf && !dropped.has(note.tailOf) ? note.tailOf.hand : undefined;
+        let playable = [0, 1].filter(h => h === tailHand || canPlay(h, note.type, time));
         // too quick for every finger: a light hit becomes a drag a free finger just slides onto
         if (!playable.length && note.type !== 3) {
             const free = [0, 1].filter(h => hands[h].contacts.filter(c => isHeld(c, time)).length < style.fingers && time - hands[h].time >= 0.06);
@@ -1627,9 +1707,10 @@ export const generateChart = (analysis: AudioAnalysis, options: GeneratorOptions
                 const [low, high] = handRange(h, f, time);
                 // the drags just before a gliding drag of the same hand are its slide, meant to be close
                 const gliding = glides(h, note.type, time);
-                const blocking = neighbours.filter(other => !(gliding && other.type === 2 && other.hand === h && other.end <= time));
+                const blocking = neighbours.filter(other => !(gliding && other.type === 2 && other.hand === h && other.end <= time)
+                    && !(h === tailHand && other.type === 3 && other.hand === h));
                 // a spot one of the hand's fingers is still on (or has only just left) is that finger's, not another's
-                const taken = style.fingers > 1 ? busyFingers(h, note.type, time) : [];
+                const taken = style.fingers > 1 && h !== tailHand ? busyFingers(h, note.type, time) : [];
                 const ok = (p: number) => {
                     const q = pointAt(f, p);
                     return handAllows(h, q, f, time) && blocking.every(other => clearOf(other, f, p, q, time))
@@ -1801,7 +1882,7 @@ export const generateChart = (analysis: AudioAnalysis, options: GeneratorOptions
         const apart = (other: PlannedNote) => (other.line === note.line ? Math.abs(note.x - other.x) : Math.hypot(note.sx - other.sx, note.sy - other.sy));
         const clear = (other: PlannedNote) => {
             const d = apart(other);
-            return d >= NOTE_GAP || (note.type === 2 && other.type === 2) || (other.line === note.line && d === 0 && canRepeat(other));
+            return d >= NOTE_GAP || (note.type === 2 && other.type === 2) || note.tailOf === other || (other.line === note.line && d === 0 && canRepeat(other));
         };
         // off by a hair from the most recent note on its line: make it an exact repeat
         const hair = near.find(other => other.line === note.line && !clear(other) && Math.abs(note.x - other.x) < 0.25 && canRepeat(other));
@@ -1824,6 +1905,74 @@ export const generateChart = (analysis: AudioAnalysis, options: GeneratorOptions
             return { official, line: note.line, hand: note.hand ?? 0 };
         })
         .sort((a, b) => a.official.time - b.official.time);
+
+    // the figures' lines: invisible, standing still, each with one note of a figure at a time. a line's own
+    // speed flies its note in from off the screen, holds it at the figure's size, then closes it on the hit
+    const figureBase = choreography?.lineCount ?? 0;
+    const figureLines: { spans: { figure: NoteFigure; x: number; y: number; angle: number; size: number; flyAt: number; closeAt: number }[] }[] = [];
+    if (motion) {
+        const close = beat / 2;
+        // a line of a square stands this far (screen heights) off the middle, so its notes meet as a '#'
+        const SQUARE_GAP = 0.03;
+        const SQUARE_SIZE = 0.07;
+        const RING_SIZE = 0.3;
+        const RING_NOTES = 8;
+        const assign = (figure: NoteFigure, sides: number, gap: number, size: number, first: number) => {
+            for (let k = 0; k < sides; k++) {
+                const angle = figure.angle + (k * 360) / sides;
+                const radians = (angle * Math.PI) / 180;
+                const line = (figureLines[first + k] ??= { spans: [] });
+                line.spans.push({
+                    figure,
+                    // the line stands off the middle towards the side its note comes from
+                    x: figure.x - Math.sin(radians) * gap * (SCREEN_HEIGHT / SCREEN_WIDTH),
+                    y: figure.y + Math.cos(radians) * gap,
+                    angle,
+                    size,
+                    flyAt: figure.from - beat,
+                    closeAt: figure.hit - close,
+                });
+            }
+        };
+        // the squares of a walk are all on screen together, each on its own four lines; later walks reuse them
+        const squares = figures.filter(f => f.kind === 'square');
+        squares.forEach((figure, i) => assign(figure, 4, SQUARE_GAP, SQUARE_SIZE, (i % 4) * 4));
+        const ring = figures.find(f => f.kind === 'ring');
+        if (ring) assign(ring, RING_NOTES, 0, RING_SIZE, 0);
+        for (const line of figureLines) line.spans.sort((a, b) => a.figure.hit - b.figure.hit);
+    }
+    /** speed changes of a figure's line: height units per second to floor units, in official time */
+    const FLY_DISTANCE = 1.6;
+    const figureSpeeds = figureLines.map(line => {
+        const events: { startTime: number; endTime: number; value: number; floorPosition: number }[] = [];
+        let floor = 0;
+        let at = EVENT_START;
+        const hits: number[] = [];
+        const run = (until: number, value: number) => {
+            if (until <= at) return;
+            events.push({ startTime: at, endTime: until, value, floorPosition: floor });
+            if (at !== EVENT_START) floor += toSeconds(until - at) * value;
+            at = until;
+        };
+        // (a note just hit carries on past the line, as any other does, rather than staying on it)
+        for (const span of line.spans) {
+            const [flyAt, shownAt, closeAt, hit] = [span.flyAt, span.figure.from, span.closeAt, span.figure.hit].map(toTime);
+            run(flyAt, hits.length ? 1 : 0);
+            run(shownAt, (FLY_DISTANCE - span.size) / 0.6 / Math.max(1e-3, toSeconds(shownAt - flyAt)));
+            run(closeAt, 0);
+            run(hit, span.size / 0.6 / Math.max(1e-3, toSeconds(hit - closeAt)));
+            hits.push(floor);
+        }
+        run(EVENT_END, 1);
+        return { events, hits };
+    });
+    figureLines.forEach((line, l) => line.spans.forEach((span, i) => exported.push({
+        official: { type: 2, time: toTime(span.figure.hit), holdTime: 0, positionX: 0, speed: 1, floorPosition: figureSpeeds[l].hits[i] },
+        line: figureBase + l,
+        hand: span.figure.x < 0.5 ? 0 : 1,
+    })));
+    exported.sort((a, b) => a.official.time - b.official.time);
+
     const officialNotes = exported.map(e => e.official);
     const lineOf = exported.map(e => e.line);
 
@@ -1872,6 +2021,22 @@ export const generateChart = (analysis: AudioAnalysis, options: GeneratorOptions
         for (let i = 0; i < (choreography?.lineCount ?? 0); i++) {
             lineEvents.push(toEvents(mainPoses.map(({ time, pose }) => ({ time, pose: choreography!.poseAt(i, toSeconds(time), pose) }))));
         }
+        for (const line of figureLines) {
+            const move: LineEvents['judgeLineMoveEvents'] = [];
+            const rotate: LineEvents['judgeLineRotateEvents'] = [];
+            let at = EVENT_START;
+            line.spans.forEach((span, i) => {
+                const [shownAt, hit] = [span.figure.from, span.figure.hit].map(toTime);
+                const until = i + 1 < line.spans.length ? toTime(line.spans[i + 1].flyAt) - 1 : EVENT_END;
+                move.push({ startTime: at, endTime: until, start: span.x, end: span.x, start2: span.y, end2: span.y });
+                const turned = span.angle + span.figure.spin;
+                rotate.push({ startTime: at, endTime: shownAt, start: span.angle, end: span.angle });
+                rotate.push({ startTime: shownAt, endTime: hit, start: span.angle, end: turned });
+                rotate.push({ startTime: hit, endTime: until, start: turned, end: turned });
+                at = until;
+            });
+            lineEvents.push({ judgeLineMoveEvents: move, judgeLineRotateEvents: rotate, judgeLineDisappearEvents: [constant(0)] });
+        }
     }
 
     const speedEvents = speedSteps.map((step, i) => ({
@@ -1886,7 +2051,7 @@ export const generateChart = (analysis: AudioAnalysis, options: GeneratorOptions
         judgeLineList: lineEvents.map((events, line) => ({
             bpm: options.bpm,
             ...events,
-            speedEvents,
+            speedEvents: line - 1 >= figureBase && line > 0 ? figureSpeeds[line - 1 - figureBase].events : speedEvents,
             notesAbove: officialNotes.filter((_, i) => lineOf[i] === line - 1),
             notesBelow: [],
         })),
@@ -1900,8 +2065,9 @@ export const generateChart = (analysis: AudioAnalysis, options: GeneratorOptions
         choreography,
         streams,
         playStyle,
+        figures: { squares: figures.filter(f => f.kind === 'square').length, rings: figures.filter(f => f.kind === 'ring').length },
         hands: plannedHands,
-        level: Math.round(Math.min(16.9, rateNotes(officialNotes.map(n => ({ time: toSeconds(n.time), type: n.type }))) + LEVEL_CALIBRATION[options.difficulty]) * 10) / 10,
+        level: Math.round(Math.min(16.9, rateNotes(officialNotes.filter((_, i) => lineOf[i] < figureBase).map(n => ({ time: toSeconds(n.time), type: n.type }))) + LEVEL_CALIBRATION[options.difficulty]) * 10) / 10,
         speed: {
             min: Math.min(...speedSteps.map(step => step.value)),
             max: Math.max(...speedSteps.map(step => step.value)),

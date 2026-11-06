@@ -19,7 +19,7 @@ import type { GeneratorDifficulty } from './chartGenerator';
 import type { BarMood, BarState, LinePose } from './lineMotion';
 
 export type Motif = 'relay' | 'split' | 'stack' | 'fan' | 'cross' | 'orbit' | 'sweep' | 'flyIn' | 'mirror' | 'pendulum' | 'converge' | 'shatter' | 'pulse'
-    | 'spiral' | 'lattice' | 'ripple' | 'scissor';
+    | 'spiral' | 'lattice' | 'ripple' | 'scissor' | 'rails' | 'frame' | 'slants' | 'web';
 
 /** how a performance's lines move between their poses */
 export type Ease = 'smooth' | 'out' | 'in' | 'sine' | 'linger';
@@ -67,6 +67,8 @@ export interface Performance {
     size: number;
     /** a relay on an upright line at the side of the screen (notes then come in sideways) */
     upright?: boolean;
+    /** a relay on a line turned over at the top of the screen (notes then come up from below) */
+    flipped?: boolean;
     variant: Variant;
 }
 
@@ -87,7 +89,7 @@ export interface Choreography {
 // how much of the playing time has performances. 36 official IN/AT charts show two or more lines 62% of the
 // time (four or more 22%), with the main line carrying a median 74% of the notes; easier charts stage less
 const COVERAGE: Record<GeneratorDifficulty, number> = { EZ: 0.25, HD: 0.4, IN: 0.55, AT: 0.62 };
-const MAX_LINES = 4;
+const MAX_LINES = 6;
 const CARRIES_NOTES: Motif[] = ['relay', 'split', 'stack'];
 // a line that is only performing stays faint (the playing lines are drawn at full strength), so it is never
 // mistaken for one to hit; official charts keep note-less lines at a mean opacity of 0.61, 35% of the time
@@ -99,14 +101,14 @@ const RELAY_TO = 0.86;
 
 /** motifs that suit each kind of section */
 const BY_STATE: Record<BarState | 'intro' | 'outro', Motif[]> = {
-    intro: ['flyIn', 'converge', 'fan', 'orbit', 'stack', 'spiral', 'lattice'],
-    silent: ['pulse', 'orbit', 'ripple'],
-    calm: ['relay', 'pulse', 'mirror', 'pendulum', 'orbit', 'stack', 'ripple'],
-    groove: ['relay', 'split', 'mirror', 'cross', 'pendulum', 'sweep', 'fan', 'stack', 'scissor', 'lattice'],
-    build: ['relay', 'converge', 'stack', 'orbit', 'pulse', 'spiral', 'ripple'],
-    drop: ['shatter', 'fan', 'cross', 'split', 'ripple', 'lattice'],
-    climax: ['relay', 'split', 'cross', 'orbit', 'sweep', 'fan', 'shatter', 'stack', 'spiral', 'scissor', 'lattice'],
-    outro: ['converge', 'fan', 'orbit', 'pulse', 'spiral', 'ripple'],
+    intro: ['flyIn', 'converge', 'fan', 'orbit', 'stack', 'spiral', 'lattice', 'slants', 'frame'],
+    silent: ['pulse', 'orbit', 'ripple', 'slants'],
+    calm: ['relay', 'pulse', 'mirror', 'pendulum', 'orbit', 'stack', 'ripple', 'rails', 'slants'],
+    groove: ['relay', 'split', 'mirror', 'cross', 'pendulum', 'sweep', 'fan', 'stack', 'scissor', 'lattice', 'rails', 'frame'],
+    build: ['relay', 'converge', 'stack', 'orbit', 'pulse', 'spiral', 'ripple', 'frame', 'web'],
+    drop: ['shatter', 'fan', 'cross', 'split', 'ripple', 'lattice', 'web'],
+    climax: ['relay', 'split', 'cross', 'orbit', 'sweep', 'fan', 'shatter', 'stack', 'spiral', 'scissor', 'lattice', 'rails', 'frame', 'web'],
+    outro: ['converge', 'fan', 'orbit', 'pulse', 'spiral', 'ripple', 'slants'],
 };
 
 /** which of the song's characters (from the line motion) each motif suits */
@@ -128,12 +130,17 @@ const CHARACTER: Record<Motif, { bounce: number; pendulum: number; wave: number 
     lattice: { bounce: 1, pendulum: 0.4, wave: 0.5 },
     ripple: { bounce: 0.6, pendulum: 0.3, wave: 1 },
     scissor: { bounce: 0.8, pendulum: 1, wave: 0.3 },
+    rails: { bounce: 0.7, pendulum: 0.5, wave: 0.8 },
+    frame: { bounce: 1, pendulum: 0.4, wave: 0.4 },
+    slants: { bounce: 0.3, pendulum: 0.7, wave: 1 },
+    web: { bounce: 0.6, pendulum: 1, wave: 0.6 },
 };
 
 const LINES: Record<Motif, [number, number]> = {
     relay: [1, 1], split: [1, 2], stack: [2, 3], fan: [2, 4], cross: [2, 2], orbit: [2, 4], sweep: [1, 2],
     flyIn: [2, 4], mirror: [1, 1], pendulum: [1, 2], converge: [2, 4], shatter: [3, 4], pulse: [2, 3],
     spiral: [3, 4], lattice: [3, 4], ripple: [2, 4], scissor: [2, 2],
+    rails: [4, 6], frame: [4, 4], slants: [3, 5], web: [4, 4],
 };
 
 const EASES: Record<Ease, (t: number) => number> = {
@@ -188,8 +195,8 @@ const motifPose = (perf: Performance, k: number, p: number, beats: number, main:
             // up and a little tilted (or upright at one side), drifts while it plays the phrase, and leaves the
             // way it came on through. it is at rest before its first note whichever way it comes
             const restX = perf.upright ? 0.5 + d * 0.22 : 0.5 + d * (0.06 + v.pivotX * 0.5);
-            const restY = perf.upright ? 0.5 : 0.5 + 0.18 * size;
-            const tilt = perf.upright ? d * (72 + 18 * size) : d * (6 + 14 * size);
+            const restY = perf.upright ? 0.5 : perf.flipped ? 0.78 : 0.5 + 0.18 * size;
+            const tilt = perf.upright ? d * (72 + 18 * size) : (perf.flipped ? 180 : 0) + d * (6 + 14 * size) * (perf.flipped ? 0.5 : 1);
             const enter = EASES[v.ease === 'smooth' || v.ease === 'sine' ? v.ease : 'out'](p / RELAY_FROM);
             const leave = smooth((p - RELAY_TO) / (1 - RELAY_TO));
             const away = 1 - enter;
@@ -289,6 +296,30 @@ const motifPose = (perf: Performance, k: number, p: number, beats: number, main:
             // two lines side by side open and close against each other on the beat
             const open = (10 + 30 * size) * Math.abs(Math.sin((Math.PI * beats) / 2));
             return { x: cx + (k ? 1 : -1) * 0.12, y: cy, angle: (k ? -1 : 1) * d * open, alpha: env * 0.75 };
+        }
+        case 'rails': {
+            // upright lines in a group at each side of the screen, drifting together on the bar
+            const side = k % 2 ? 1 : -1;
+            const drift = 0.02 * Math.sin((Math.PI * beats) / 4);
+            return { x: 0.5 + side * (0.34 + 0.05 * Math.floor(k / 2) + drift), y: 0.5, angle: 90, alpha: env * (0.8 - 0.2 * Math.floor(k / 2)) };
+        }
+        case 'frame': {
+            // two level and two upright lines box the screen in, tightening a little on each beat
+            const squeeze = 0.015 * size * Math.max(0, 1 - (beats % 1) * 3);
+            const inset = 0.06 + squeeze;
+            if (k < 2) return { x: 0.5, y: k ? 1 - inset : inset, angle: 0, alpha: env * 0.8 };
+            return { x: k === 2 ? inset : 1 - inset, y: 0.5, angle: 90, alpha: env * 0.8 };
+        }
+        case 'slants': {
+            // parallel diagonals side by side, drifting slowly across
+            const angle = d * (55 + 20 * size);
+            return { x: cx + (k - (n - 1) / 2) * 0.24 + d * 0.2 * (p - 0.5), y: 0.5, angle, alpha: env * 0.6 };
+        }
+        case 'web': {
+            // long lines crossing in a diamond over the screen, turning slowly
+            const pair = k < 2 ? 1 : -1;
+            const offset = (k % 2 ? 1 : -1) * 0.16;
+            return { x: cx + offset, y: cy, angle: pair * (30 + 20 * size) + d * 25 * p, alpha: env * 0.65 };
         }
         case 'pulse':
         default: {
@@ -410,7 +441,10 @@ export const buildChoreography = (options: {
         const [lo, hi] = LINES[motif];
         const perf: Performance = { motif, start, end, lines: Math.min(MAX_LINES, lo + Math.round(random() * (hi - lo))), direction: random() < 0.5 ? -1 : 1, size: clamp(0.3 + 0.6 * intensity + 0.2 * (random() - 0.5), 0, 1), variant: makeVariant(motif) };
         // official charts put 15% of their off-main notes on upright lines; relays carry most of ours
-        if (motif === 'relay') perf.upright = random() < 0.3;
+        if (motif === 'relay') {
+            perf.upright = random() < 0.3;
+            perf.flipped = !perf.upright && random() < 0.25;
+        }
         // a look the song has shown already is drawn again (a few tries), so each performance is a new one
         for (let tries = 0; tries < 4 && looks.has(look(motif, perf.variant)); tries++) perf.variant = makeVariant(motif);
         looks.add(look(motif, perf.variant));
